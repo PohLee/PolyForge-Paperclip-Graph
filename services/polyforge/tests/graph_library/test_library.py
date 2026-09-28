@@ -16,6 +16,8 @@ from polyforge.core.compiler.compile import compile_definition, graph_loops
 from polyforge.core.compiler.policy_catalog import CEILINGS, catalog_versions
 from polyforge.core.compiler.validate import validate_definition
 from polyforge.core.errors import ErrorCode, PolyForgeError
+from polyforge.core.gates.evaluators_domain import DOMAIN_EVALUATORS
+from polyforge.core.runtime.planner import build_plan
 from polyforge.core.state import NodeKind
 from polyforge.graph_library import (
     CAPABILITY_VERSIONS,
@@ -28,7 +30,7 @@ from polyforge.graph_library import (
 )
 
 _EXPECTED = {
-    "requirement": ({"requirement.start"}, 4),
+    "requirement": ({"requirement.start"}, 5),
     "design": ({"design.start", "design.security_review", "design.resume_review"}, 3),
     "implementation": ({"implementation.start"}, 6),
     "verification": ({"verification.start"}, 5),
@@ -147,6 +149,30 @@ class ValidationTest(unittest.TestCase):
                     continue
                 with self.subTest(graph=graph_id, node=node_id):
                     self.assertTrue(node.get("evaluatorRefs") or node.get("humanDecision"))
+
+    def test_every_domain_evaluator_can_see_a_declared_producer_in_its_lineage(self):
+        evidence_kinds = {
+            evaluator.ref: evaluator.evidence_kind
+            for evaluator in DOMAIN_EVALUATORS()
+            if getattr(evaluator, "evidence_kind", "")
+        }
+        for graph_id, definition in all_definitions().items():
+            entrypoint = next(iter(definition["entrypoints"]))
+            plan = build_plan(definition, entrypoint=entrypoint)
+            for node_id, node in definition["nodes"].items():
+                if node.get("kind") != NodeKind.GATE.value:
+                    continue
+                produced = {
+                    kind
+                    for ancestor in plan.ancestors(node_id)
+                    for kind in definition["nodes"][ancestor].get("produces", [])
+                }
+                for evaluator_ref in node.get("evaluatorRefs", []):
+                    evidence_kind = evidence_kinds.get(evaluator_ref)
+                    if evidence_kind is None:
+                        continue
+                    with self.subTest(graph=graph_id, gate=node_id, evaluator=evaluator_ref):
+                        self.assertIn(evidence_kind, produced)
 
     def test_design_models_the_worked_example(self):
         definition = load_graph("design")

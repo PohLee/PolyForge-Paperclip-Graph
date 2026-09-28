@@ -100,6 +100,13 @@ export interface HealthData {
      * covers them, which is why this is surfaced rather than merely logged.
      */
     unknownCoreIntentKinds: number;
+    /**
+     * A Core intent whose *payload* this build cannot read, as distinct from a kind it does not
+     * carry. Left unacknowledged, like an unknown kind, because the Core still owns the obligation
+     * and no work unit was created. Counted separately so a producer/consumer shape drift is
+     * visible in health rather than only as a retry loop.
+     */
+    unreadableCoreIntentPayload: number;
     /** A Core intent that could not be made durable. The Core kept the obligation. */
     coreOutboxEnqueueFailed: number;
     /** A Core intent whose acknowledgement failed; its lease expires and it is re-claimed. */

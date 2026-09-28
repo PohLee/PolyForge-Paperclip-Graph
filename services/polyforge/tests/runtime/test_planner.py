@@ -295,6 +295,19 @@ class GuardTests(unittest.TestCase):
 
 
 class BoundedLoopTests(unittest.TestCase):
+    def test_a_rework_feedback_edge_does_not_block_the_first_iteration(self) -> None:
+        graph = _diamond()
+        graph["edges"].append({"from": "merge", "to": "left", "guard": "rework"})
+        plan = build_plan(graph, entrypoint="start")
+        self.assertEqual(plan.predecessors("left"), ())
+        self.assertEqual(plan.predecessors("left", include_feedback=True), ("merge",))
+        decisions = plan_states(
+            plan,
+            node_states=_states(left="PENDING", right="PENDING", merge="PENDING", orphan="PENDING"),
+            available_exports={"seed": "sha256:seed"},
+        )
+        self.assertEqual(decisions["left"].status, NodeStatus.READY)
+
     def test_reaching_the_rework_ceiling_blocks_rather_than_looping(self) -> None:
         graph = _diamond()
         graph["nodes"]["left"]["retryBudget"] = {"maxAttempts": 2}

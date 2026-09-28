@@ -144,15 +144,51 @@ class ExecutionPlan:
     def has_node(self, node_id: str) -> bool:
         return str(node_id) in self.nodes
 
-    def predecessors(self, node_id: str) -> tuple[str, ...]:
-        return tuple(
-            sorted({str(e["from"]) for e in self.edges if str(e.get("to")) == str(node_id)})
+    @staticmethod
+    def _is_feedback_edge(edge: Mapping[str, Any]) -> bool:
+        """A rework edge is a transition trigger, not an initial dependency."""
+        guard = edge.get("guard")
+        if isinstance(guard, str):
+            return guard == "rework"
+        return isinstance(guard, Mapping) and (
+            guard.get("transition") == "rework" or guard.get("event") == "rework"
         )
 
-    def successors(self, node_id: str) -> tuple[str, ...]:
+    def predecessors(self, node_id: str, *, include_feedback: bool = False) -> tuple[str, ...]:
         return tuple(
-            sorted({str(e["to"]) for e in self.edges if str(e.get("from")) == str(node_id)})
+            sorted(
+                {
+                    str(e["from"])
+                    for e in self.edges
+                    if str(e.get("to")) == str(node_id)
+                    and (include_feedback or not self._is_feedback_edge(e))
+                }
+            )
         )
+
+    def successors(self, node_id: str, *, include_feedback: bool = False) -> tuple[str, ...]:
+        return tuple(
+            sorted(
+                {
+                    str(e["to"])
+                    for e in self.edges
+                    if str(e.get("from")) == str(node_id)
+                    and (include_feedback or not self._is_feedback_edge(e))
+                }
+            )
+        )
+
+    def ancestors(self, node_id: str) -> tuple[str, ...]:
+        """All normal-dependency ancestors, excluding feedback-only rework edges."""
+        found: set[str] = set()
+        pending = list(self.predecessors(node_id))
+        while pending:
+            predecessor = pending.pop()
+            if predecessor in found:
+                continue
+            found.add(predecessor)
+            pending.extend(self.predecessors(predecessor))
+        return tuple(sorted(found))
 
     def ordered_node_ids(self) -> tuple[str, ...]:
         """Sorted node ids: a stable iteration order is what makes planning reproducible."""

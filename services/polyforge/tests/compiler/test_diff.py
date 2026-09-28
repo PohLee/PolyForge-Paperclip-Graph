@@ -42,13 +42,19 @@ class NoOpDiffTest(unittest.TestCase):
 
     def test_from_nothing_is_all_additions(self):
         diff = semantic_diff(None, load_graph("requirement"))
-        self.assertEqual(diff.added_nodes, ["analyze", "baseline", "clarify", "requirement_gate"])
+        self.assertEqual(
+            diff.added_nodes,
+            ["acceptance_review", "analyze", "baseline", "clarify", "requirement_gate"],
+        )
         self.assertEqual(diff.removed_nodes, [])
         self.assertTrue(diff.invalidates_evidence)
 
     def test_to_nothing_is_all_removals(self):
         diff = semantic_diff(load_graph("requirement"), None)
-        self.assertEqual(diff.removed_nodes, ["analyze", "baseline", "clarify", "requirement_gate"])
+        self.assertEqual(
+            diff.removed_nodes,
+            ["acceptance_review", "analyze", "baseline", "clarify", "requirement_gate"],
+        )
         self.assertTrue(diff.invalidates_evidence)
 
 

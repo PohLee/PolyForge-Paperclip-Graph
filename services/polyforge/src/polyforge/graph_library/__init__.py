@@ -57,6 +57,7 @@ CAPABILITY_VERSIONS: Final[dict[str, int]] = {
     "requirement.baseline": 1,
     "requirement.clarify": 1,
     "requirement.coordinate": 1,
+    "requirement.review": 1,
     "design.coordinate": 1,
     "release.coordinate": 1,
     "security.review": 2,

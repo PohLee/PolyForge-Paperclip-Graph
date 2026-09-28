@@ -47,6 +47,8 @@ export const INTENT_KINDS = {
   artifactPublish: "artifact.publish",
   /** Acknowledge one Core outbox delivery after its effect is durably applied. */
   coreDeliveryAck: "core.delivery_ack",
+  /** Record a committed Core migration and its successor run in the bridge store. */
+  migrationApplied: "migration.applied",
 } as const;
 export type IntentKind = (typeof INTENT_KINDS)[keyof typeof INTENT_KINDS];
 
@@ -71,7 +73,7 @@ export const CORE_INTENT_KINDS = {
   "governance.authorization": INTENT_KINDS.authorizationCheck,
   "artifact.publish": INTENT_KINDS.artifactPublish,
   "effect.deliver": INTENT_KINDS.coreDeliveryAck,
-  "migration.applied": INTENT_KINDS.workUnitProjectStatus,
+  "migration.applied": INTENT_KINDS.migrationApplied,
 } as const satisfies Record<string, IntentKind>;
 
 export type CoreIntentKind = keyof typeof CORE_INTENT_KINDS;
@@ -104,11 +106,14 @@ const INTENT_CLASS: Record<IntentKind, IntentClass> = {
   [INTENT_KINDS.workUnitProjectStatus]: "write",
   [INTENT_KINDS.executionRequestStop]: "write",
   [INTENT_KINDS.executionInspect]: "read",
-  [INTENT_KINDS.governanceInteractionCreate]: "human_gate",
+  // Creating the interaction is a platform write. The human gate starts only after this handler
+  // has durably created the object a person can answer.
+  [INTENT_KINDS.governanceInteractionCreate]: "write",
   [INTENT_KINDS.governanceRecordResolution]: "write",
   [INTENT_KINDS.authorizationCheck]: "read",
   [INTENT_KINDS.artifactPublish]: "write",
   [INTENT_KINDS.coreDeliveryAck]: "write",
+  [INTENT_KINDS.migrationApplied]: "write",
 };
 
 export function intentClass(kind: string): IntentClass {

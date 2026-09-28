@@ -39,7 +39,13 @@ _DEFINITION: Final[dict[str, Any]] = {
                 "fallbackRoles": ["tech_lead"],
             },
             "startNodes": ["deploy_authorization"],
-            "exports": ["deployment_authorization", "deployment_receipt", "release_quality_decision"],
+            "exports": [
+                "deployment_authorization",
+                "deployment_receipt",
+                "deployment_record",
+                "rollback_plan",
+                "release_quality_decision",
+            ],
         }
     },
     "nodes": {
@@ -55,7 +61,7 @@ _DEFINITION: Final[dict[str, Any]] = {
             "id": "deploy",
             "kind": "external_effect",
             "inputs": {"authorization": "deployment_authorization"},
-            "produces": ["deployment_receipt"],
+            "produces": ["deployment_receipt", "deployment_record", "rollback_plan"],
             "timeoutSeconds": 3600,
             "retryBudget": {"maxAttempts": 1},
         },

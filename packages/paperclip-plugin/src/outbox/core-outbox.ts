@@ -3,6 +3,7 @@ import type { BridgeMetrics } from "../metrics.js";
 import type { BridgeStore } from "../store.js";
 import type { Scope } from "@polyforge/protocol";
 import { bridgeIntentFor, effectKey, knownCoreIntentKinds, type IntentKind } from "./intents.js";
+import { mapCoreIntentPayload } from "./core-intent-mapping.js";
 import type { CoreOutboxIntent, RuntimeClient } from "../runtime-client.js";
 
 /**
@@ -102,6 +103,7 @@ export class CoreOutboxPump {
     }
 
     const unknownKinds: string[] = [];
+    const refused: string[] = [];
     let enqueued = 0;
     let duplicates = 0;
     let acknowledged = 0;
@@ -124,6 +126,34 @@ export class CoreOutboxPump {
         continue;
       }
 
+      // Per-kind mapping. Core messages and provider-neutral port DTOs use different field names
+      // for work units, projections, governance requests and stop targets; authenticated scope and
+      // correlation data are supplied from the claimed envelope rather than trusted from payload.
+      let mappedPayload: Record<string, unknown>;
+      try {
+        mappedPayload = {
+          ...mapCoreIntentPayload(intent.kind, intent.payload, {
+            scope,
+            correlationId: intent.correlationKey,
+          }),
+          coreIntentId: intent.intentId,
+          coreKind: intent.kind,
+        };
+      } catch (error) {
+        // Refused, and left unacknowledged. Acking it would tell the Core it was delivered when no
+        // work unit was ever created; failing it would discard an obligation the Core still owns.
+        // Unacknowledged is the only honest state: the lease expires and a build that can read the
+        // intent will claim it again.
+        refused.push(intent.kind);
+        metrics.bump(scope.companyRef, "unreadableCoreIntentPayload", 1);
+        logger.error("the Core sent an intent payload this build cannot read", {
+          intentId: intent.intentId,
+          kind: intent.kind,
+          error: error instanceof Error ? error.message : String(error),
+        });
+        continue;
+      }
+
       try {
         const created = this.#deps.begin({
           // Keyed on the Core's intent id, so a re-claim is a duplicate rather than a second intent.
@@ -131,7 +161,7 @@ export class CoreOutboxPump {
           kind: mapped,
           scope,
           correlationId: intent.correlationKey,
-          payload: { ...intent.payload, coreIntentId: intent.intentId, coreKind: intent.kind },
+          payload: mappedPayload,
           runId: intent.runId,
           nodeId: intent.nodeId,
         });

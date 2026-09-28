@@ -61,6 +61,7 @@ const COUNTER_LABELS: Readonly<Record<keyof HealthData["counters"], string>> = {
   artifactDigestMismatch: "Artifact digest mismatches",
   crossScopeDenials: "Cross-scope denials",
   unknownCoreIntentKinds: "Core intents with no bridge equivalent",
+  unreadableCoreIntentPayload: "Core intents whose payload this build cannot read",
   coreOutboxEnqueueFailed: "Core intents that could not be made durable",
   coreOutboxAckFailed: "Core intent acknowledgements that failed",
   controlPlaneUnavailable: "Passes that could not reach the Core",
@@ -371,6 +372,8 @@ function counterMeaning(key: keyof HealthData["counters"]): string {
       return "Registered artifacts whose content hash did not match. Evidence built on these is rejected.";
     case "unknownCoreIntentKinds":
       return "The Core asked for work this build cannot express as a bridge intent. Those intents stay queued and are re-claimed; nothing was dropped. This clears when the mapping covers the kind.";
+    case "unreadableCoreIntentPayload":
+      return "The Core sent an intent whose payload this build cannot map onto a work order, so no work unit was created and the intent stays queued. This is a producer/consumer shape difference, not a transient fault: it does not clear on its own.";
     case "coreOutboxEnqueueFailed":
       return "A Core intent could not be written to the bridge's durable queue, so the Core still owns it. Check that the store is writable.";
     case "coreOutboxAckFailed":

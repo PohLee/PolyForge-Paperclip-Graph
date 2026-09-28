@@ -161,6 +161,80 @@ test("AT-25: every side-effecting tool returns a durable reference, not a promis
   assert.ok(claim, "the claim is a durable reference too");
 });
 
+test("AT-25: an evidence artifact keeps the hash and source the worker verified", async () => {
+  const bridge = track(await withRun());
+  await bridge.callTool("current", { adopt: true }, runCtx());
+  // The record `submit_artifact` handed back: the digest the port actually compared against the
+  // bytes, and the immutable source it re-scoped to the bound issue.
+  await bridge.callTool(
+    "submit_artifact",
+    {
+      nodeId: "n1",
+      artifacts: [
+        {
+          kind: "test_report",
+          contentHash: "sha256:report",
+          source: { kind: "inline", ref: "report.txt", body: "42 passed" },
+        },
+      ],
+    },
+    runCtx(),
+  );
+
+  await bridge.callTool(
+    "submit_evidence",
+    {
+      nodeId: "n1",
+      evidence: [
+        {
+          kind: "test_report",
+          artifacts: [
+            {
+              kind: "test_report",
+              contentHash: "sha256:report",
+              source: { kind: "inline", ref: "issue:iss-1/report.txt" },
+            },
+          ],
+        },
+      ],
+    },
+    runCtx(),
+  );
+
+  const command = bridge.runtime.commands.find((entry) => entry.kind === "EVIDENCE");
+  assert.ok(command, "the evidence command reached the Core");
+  const payload = command.body["payload"] as { evidence: Record<string, unknown>[] };
+  const artifacts = payload.evidence[0]?.["artifacts"] as Record<string, unknown>[];
+  assert.equal(artifacts.length, 1);
+  // The Core's ingestion refuses an artifact with no well-formed sha256 (`content_hash_invalid`) and
+  // refuses a mutable identity. Rebuilding the artifact as `{provider, kind, id}` dropped both, so
+  // no evidence carrying an artifact could ever be registered.
+  assert.equal(
+    artifacts[0]?.["contentHash"],
+    "sha256:report",
+    "the evidence must reach the Core with the digest it verified",
+  );
+  assert.equal(artifacts[0]?.["kind"], "test_report", "and with its business kind, not a provider ref");
+  assert.deepEqual(artifacts[0]?.["source"], { kind: "inline", ref: "issue:iss-1/report.txt" });
+});
+
+test("AT-25: an evidence artifact with no hash is refused before the Core has to reject it", async () => {
+  const bridge = track(await withRun());
+  await bridge.callTool("current", { adopt: true }, runCtx());
+  const result = await bridge.callTool(
+    "submit_evidence",
+    {
+      nodeId: "n1",
+      evidence: [{ kind: "test_report", artifacts: [{ kind: "test_report", source: { kind: "inline", ref: "r.txt" } }] }],
+    },
+    runCtx(),
+  );
+  const data = envelope(result);
+  assert.notEqual(data["status"], "PENDING", "a hashless artifact is not a submittable evidence record");
+  const blockers = data["blockers"] as Record<string, unknown>[];
+  assert.match(String(blockers[0]?.["message"]), /content hash/);
+});
+
 test("AT-25: the run survives the agent session ending", async () => {
   const bridge = track(await withRun());
   await bridge.callTool("current", { adopt: true }, runCtx());

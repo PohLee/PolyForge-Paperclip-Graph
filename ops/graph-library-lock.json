@@ -14,6 +14,7 @@
     "requirement.baseline": 1,
     "requirement.clarify": 1,
     "requirement.coordinate": 1,
+    "requirement.review": 1,
     "security.review": 2,
     "verification.coordinate": 1
   },
@@ -256,6 +257,8 @@
             "unit_test_report",
             "frontend_commit",
             "ui_test_report",
+            "test_report",
+            "code_review",
             "review_findings",
             "implementation_acceptance"
           ],
@@ -414,7 +417,9 @@
             "version": 1
           },
           "produces": [
-            "review_findings"
+            "review_findings",
+            "code_review",
+            "test_report"
           ],
           "retryBudget": {
             "maxAttempts": 2
@@ -459,6 +464,8 @@
           "exports": [
             "deployment_authorization",
             "deployment_receipt",
+            "deployment_record",
+            "rollback_plan",
             "release_quality_decision"
           ],
           "inputs": [
@@ -483,7 +490,9 @@
           },
           "kind": "external_effect",
           "produces": [
-            "deployment_receipt"
+            "deployment_receipt",
+            "deployment_record",
+            "rollback_plan"
           ],
           "retryBudget": {
             "maxAttempts": 1
@@ -549,6 +558,10 @@
         },
         {
           "from": "baseline",
+          "to": "acceptance_review"
+        },
+        {
+          "from": "acceptance_review",
           "to": "requirement_gate"
         },
         {
@@ -571,6 +584,8 @@
             "clarified_requirements",
             "analysis_findings",
             "requirement_baseline",
+            "requirement_spec",
+            "acceptance_criteria_review",
             "requirement_acceptance"
           ],
           "inputs": [
@@ -586,6 +601,35 @@
       "graphId": "requirement",
       "name": "Requirement",
       "nodes": {
+        "acceptance_review": {
+          "executor": {
+            "independentFrom": [
+              "requirement.producer"
+            ],
+            "preferredRoles": [
+              "product"
+            ],
+            "requiredCapabilities": [
+              "requirement.review"
+            ]
+          },
+          "id": "acceptance_review",
+          "inputs": {
+            "requirement": "requirement_spec"
+          },
+          "kind": "agent_operation",
+          "operation": {
+            "id": "requirement.review",
+            "version": 1
+          },
+          "produces": [
+            "acceptance_criteria_review"
+          ],
+          "retryBudget": {
+            "maxAttempts": 2
+          },
+          "timeoutSeconds": 3600
+        },
         "analyze": {
           "executor": {
             "preferredRoles": [
@@ -631,7 +675,8 @@
             "version": 1
           },
           "produces": [
-            "requirement_baseline"
+            "requirement_baseline",
+            "requirement_spec"
           ],
           "retryBudget": {
             "maxAttempts": 2
@@ -728,6 +773,7 @@
           "exports": [
             "qa_report",
             "security_review_report",
+            "security_report",
             "regression_report",
             "verification_evidence_set",
             "acceptance_decision"
@@ -846,7 +892,8 @@
             "version": 2
           },
           "produces": [
-            "security_review_report"
+            "security_review_report",
+            "security_report"
           ],
           "retryBudget": {
             "maxAttempts": 2
@@ -970,7 +1017,8 @@
       "capabilities": {
         "requirement.analyze": 1,
         "requirement.baseline": 1,
-        "requirement.clarify": 1
+        "requirement.clarify": 1,
+        "requirement.review": 1
       },
       "compilerVersion": "polyforge-compiler/1.0.0",
       "evaluators": {
@@ -981,7 +1029,8 @@
       "operations": {
         "requirement.analyze": 1,
         "requirement.baseline": 1,
-        "requirement.clarify": 1
+        "requirement.clarify": 1,
+        "requirement.review": 1
       },
       "policies": {
         "policy.budget_and_authority_ceilings": 1,

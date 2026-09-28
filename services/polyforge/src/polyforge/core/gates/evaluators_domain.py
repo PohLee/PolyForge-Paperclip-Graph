@@ -45,13 +45,67 @@ def _detail(record: Mapping[str, Any]) -> Mapping[str, Any]:
     return detail if isinstance(detail, Mapping) else {}
 
 
+#: The severities this codebase uses. A finding outside the vocabulary is malformed, not "low".
+SEVERITIES: frozenset[str] = frozenset({"info", "low", "medium", "high", "critical"})
+
+
 def _findings(record: Mapping[str, Any]) -> list[Mapping[str, Any]]:
     raw = _detail(record).get("findings")
     return [item for item in raw if isinstance(item, Mapping)] if isinstance(raw, Sequence) and not isinstance(raw, str) else []
 
 
+def _finding_problems(record: Mapping[str, Any]) -> list[str]:
+    """Every reason this record's findings cannot be read as findings.
+
+    A finding is a claim about something, with an id, a severity from the vocabulary, and a real
+    boolean saying whether it is closed. Anything else is a record this check cannot judge, and the
+    earlier version of this code did judge it -- by filtering the unrecognisable entries out and
+    reporting the remainder. Three failures came from that one decision:
+
+    * ``[42]`` became an empty list, so "unreadable" read as "we looked and found nothing";
+    * ``resolved: "false"`` is truthy, so a critical finding was reported closed;
+    * an unknown severity ranked 0, the same as ``info``, so it fell out of the high/critical band
+      this check exists to police.
+    """
+    raw = _detail(record).get("findings")
+    if not isinstance(raw, Sequence) or isinstance(raw, str):
+        return ["the record's findings field is not a list"]
+    problems: list[str] = []
+    for index, item in enumerate(raw):
+        if not isinstance(item, Mapping):
+            problems.append(f"entry {index} is {type(item).__name__}, not a finding object")
+            continue
+        if not str(item.get("id", "")).strip():
+            problems.append(f"entry {index} names no finding")
+        # Severity and disposition are optional -- a threat carries no severity and nothing to
+        # close, a review finding may carry no severity at all -- but neither may be present and
+        # wrong. An absent disposition counts as open, which is the direction that refuses.
+        severity = item.get("severity")
+        if severity is not None and str(severity).lower() not in SEVERITIES:
+            problems.append(
+                f"entry {index} has severity {str(severity).lower()!r}, which is not one of "
+                f"{', '.join(sorted(SEVERITIES))}"
+            )
+        resolved = item.get("resolved")
+        if resolved is not None and not isinstance(resolved, bool):
+            problems.append(f"entry {index} does not say whether it is resolved, as a real boolean")
+    return problems
+
+
 def _unresolved(record: Mapping[str, Any]) -> list[Mapping[str, Any]]:
-    return [f for f in _findings(record) if not bool(f.get("resolved"))]
+    return [f for f in _findings(record) if f.get("resolved") is not True]
+
+
+def _count(value: Any) -> int | None:
+    """A non-negative count, or ``None`` when the value is not one.
+
+    ``None`` is not zero. A report that omits a count, spells it as a string, or reports a negative
+    number has not made a claim, and treating any of those as "not zero, therefore fine" is how a
+    malformed report reaches a pass.
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value if value >= 0 else None
 
 
 def _highest_severity(record: Mapping[str, Any]) -> str:
@@ -110,21 +164,62 @@ class _EvidenceCheck:
     def _has_independent_producer(self, context: EvaluationContext, records: Sequence[Mapping[str, Any]]) -> bool:
         """True when something other than the author produced the evidence.
 
-        The author is read from the node first and the run second, because a graph that sets an
-        author per node and a run that sets one globally both appear in practice and picking the
-        wrong one would silently stop enforcing this.
+        Scoped to the node's *own* evidence, because that is the only place the question can be
+        answered from this snapshot. A gate evaluates a predecessor's artifact precisely because it
+        did not author it -- ``design_gate`` runs ``threat_model_review_v2`` against a threat model
+        the ``security_review`` node produced, and the shipped graph records that a gate cannot
+        produce the thing it judges. Measuring those producers against the authors of the work this
+        node depends on would ask a gate to prove it is independent of the work it was built to
+        judge, which no gate can satisfy and which would make every gate in the library unreachable.
+
+        For all-upstream evidence the separation decision has already happened at claim time. The
+        runtime resolves the evidence and assignment subjects of every normal-dependency ancestor
+        and refuses a subject named in that set when the node declares ``independentFrom``. This
+        read-only evaluator therefore verifies evidence content; it does not try to repeat an
+        admission decision from a smaller snapshot.
+
+        Within the node's own evidence, the author is read from the two places the engine actually
+        records it, both derived from database rows rather than from the request: the node's
+        ``assigned_subject``, and ``producer_subjects``. There is deliberately no ``node.author`` or
+        ``run.author`` here. The runtime table is ``node_executions`` and has no author column, and
+        the engine hands an evaluator a run reduced to five keys, so those reads always returned
+        nothing -- an author set that is always empty makes ``producers - authors`` equal to
+        ``producers``, and the check passed for any evidence with a producer at all. Separation that
+        was never enforced.
+
+        An empty author set is a refusal, not a pass. If nothing names who did the work, nothing
+        establishes that the producer is somebody else, and this module's first rule is that a check
+        which cannot find what it needs must not pass on the grounds that it found nothing.
         """
-        authors = {
-            value
-            for value in (
-                str(context.node.get("author", "")),
-                str(context.run.get("author", "")),
-            )
-            if value
-        }
-        producers = {str(record.get("producerSubject", "")) for record in records}
+        own_ids = {str(record.get("evidenceId", "")) for record in context.evidence}
+        own = [record for record in records if str(record.get("evidenceId", "")) in own_ids]
+        if not own:
+            # Everything under judgment was produced upstream: this node is reviewing, not authoring.
+            return True
+        authors = {str(context.node.get("assigned_subject") or "")}
+        authors.update(str(subject) for subject in context.producer_subjects)
+        authors.discard("")
+        if not authors:
+            return False
+        producers = {str(record.get("producerSubject", "")) for record in own}
         producers.discard("")
         return bool(producers - authors)
+
+    def _unreadable_finding(self, record: Mapping[str, Any]) -> tuple[str, str, tuple[str, ...]] | None:
+        """An ``ESCALATE`` when this record's findings cannot be read, or ``None`` when they can.
+
+        Applied before any of the severity or disposition reasoning, because a check that has
+        already decided what a finding means has to be told first that the finding is not a finding.
+        """
+        problems = _finding_problems(record)
+        if not problems:
+            return None
+        return (
+            GateResult.ESCALATE,
+            "the report's findings cannot be read as findings, so it has not been reviewed: "
+            f"{'; '.join(problems[:5])}",
+            (),
+        )
 
     def _judge(
         self, context: EvaluationContext, records: Sequence[Mapping[str, Any]]
@@ -191,6 +286,10 @@ class _ThreatModelReviewV2(_EvidenceCheck):
     requires_independent_producer = True
 
     def _judge(self, context: EvaluationContext, records: Sequence[Mapping[str, Any]]) -> tuple[str, str, tuple[str, ...]]:
+        for record in records:
+            unreadable = self._unreadable_finding(record)
+            if unreadable is not None:
+                return unreadable
         empty = [str(record.get("evidenceId", "")) for record in records if len(_findings(record)) == 0]
         if empty:
             return (
@@ -209,21 +308,31 @@ class _TestReportCheckV1(_EvidenceCheck):
     evidence_kind = "test_report"
 
     def _judge(self, context: EvaluationContext, records: Sequence[Mapping[str, Any]]) -> tuple[str, str, tuple[str, ...]]:
-        failing = [
-            str(record.get("evidenceId", ""))
-            for record in records
-            if str(_detail(record).get("result", "")).lower() in ("failed", "failing", "red")
-            or int(_detail(record).get("failed", 0) or 0) > 0
-        ]
-        if failing:
-            return GateResult.ESCALATE, f"the test report records failures: {', '.join(failing)}", ()
-        unrun = [str(record.get("evidenceId", "")) for record in records if int(_detail(record).get("total", 0) or 0) == 0]
-        if unrun:
-            return (
-                GateResult.ESCALATE,
-                f"the test report records no tests at all, which is not a passing run: {', '.join(unrun)}",
-                (),
-            )
+        for record in records:
+            total = _count(_detail(record).get("total"))
+            failed = _count(_detail(record).get("failed"))
+            if total is None or failed is None:
+                return (
+                    GateResult.ESCALATE,
+                    "the test report does not record usable total and failed counts, so it cannot "
+                    f"say what ran: {str(record.get('evidenceId', ''))}",
+                    (),
+                )
+            if total == 0:
+                return (
+                    GateResult.ESCALATE,
+                    f"the test report records no tests at all, which is not a passing run: {str(record.get('evidenceId', ''))}",
+                    (),
+                )
+            if failed > total:
+                return (
+                    GateResult.ESCALATE,
+                    f"the test report records {failed} failing of {total} test(s), which is not a "
+                    f"possible run: {str(record.get('evidenceId', ''))}",
+                    (),
+                )
+            if failed > 0 or str(_detail(record).get("result", "")).lower() in ("failed", "failing", "red"):
+                return GateResult.ESCALATE, f"the test report records failures: {str(record.get('evidenceId', ''))}", ()
         return GateResult.PASS, "the test report records a run with no failures", ()
 
 
@@ -238,6 +347,9 @@ class _ReviewFindingsCheckV1(_EvidenceCheck):
         open_findings: list[str] = []
         total = 0
         for record in records:
+            unreadable = self._unreadable_finding(record)
+            if unreadable is not None:
+                return unreadable
             open_findings.extend(
                 str(finding.get("id", "?")) for finding in _unresolved(record)
             )
@@ -277,7 +389,25 @@ class _QaReportCheckV2(_EvidenceCheck):
                 )
             judged = str(_detail(record).get("inputRevision", ""))
             current = str(context.decision_target_hash or context.evidence_set_hash or "")
-            if judged and current and judged != current:
+            # Both halves are required. Comparing only when both happened to be present made naming
+            # a stale input a failure while omitting the field entirely was a pass, so the cheaper
+            # lie to tell was to say nothing.
+            if not judged:
+                return (
+                    GateResult.ESCALATE,
+                    "the QA report names no inputRevision, so it cannot be shown to have judged what "
+                    "is being passed; a verdict that does not say what it looked at cannot be "
+                    f"invalidated when the inputs move: {str(record.get('evidenceId', ''))}",
+                    (),
+                )
+            if not current:
+                return (
+                    GateResult.ESCALATE,
+                    "no trusted current revision is bound to this decision, so the QA report's "
+                    f"inputRevision cannot be checked: {str(record.get('evidenceId', ''))}",
+                    (),
+                )
+            if judged != current:
                 return (
                     GateResult.ESCALATE,
                     f"the QA report judged {judged} but the current evidence set is {current}, so it "
@@ -296,6 +426,18 @@ class _SecurityReportCheckV1(_EvidenceCheck):
 
     def _judge(self, context: EvaluationContext, records: Sequence[Mapping[str, Any]]) -> tuple[str, str, tuple[str, ...]]:
         for record in records:
+            unreadable = self._unreadable_finding(record)
+            if unreadable is not None:
+                return unreadable
+            raw = _detail(record).get("findings")
+            if not isinstance(raw, Sequence) or isinstance(raw, str):
+                return (
+                    GateResult.ESCALATE,
+                    "the security report records no findings list, so a scan that found nothing and "
+                    "a scan that never ran are the same report to this check: "
+                    f"{str(record.get('evidenceId', ''))}",
+                    (),
+                )
             severity = _highest_severity(record)
             if severity in ("high", "critical"):
                 open_now = _unresolved(record)
@@ -318,7 +460,14 @@ class _RegressionCheckV1(_EvidenceCheck):
     def _judge(self, context: EvaluationContext, records: Sequence[Mapping[str, Any]]) -> tuple[str, str, tuple[str, ...]]:
         for record in records:
             new_failures = _detail(record).get("newFailures")
-            if isinstance(new_failures, Sequence) and not isinstance(new_failures, str) and len(new_failures) > 0:
+            if not isinstance(new_failures, Sequence) or isinstance(new_failures, str):
+                return (
+                    GateResult.ESCALATE,
+                    "the regression report records no newFailures result, so it does not say whether "
+                    f"the run was clean: {str(record.get('evidenceId', ''))}",
+                    (),
+                )
+            if len(new_failures) > 0:
                 return (
                     GateResult.ESCALATE,
                     f"the regression run reports {len(new_failures)} new failure(s)",

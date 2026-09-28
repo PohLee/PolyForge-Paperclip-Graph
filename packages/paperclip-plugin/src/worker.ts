@@ -71,7 +71,7 @@ import {
 import type { ToolHandlerDeps } from "./tools/register.js";
 import { companyScope } from "./identity.js";
 import { isBridgeError } from "./errors.js";
-import type { ActorAssertion, RunSnapshot, Scope } from "@polyforge/protocol";
+import type { ActorAssertion, RunSnapshot, Scope, WorkerRequirement } from "@polyforge/protocol";
 
 const manifest = manifestJson as PaperclipPluginManifestV1;
 
@@ -173,6 +173,54 @@ function str(value: unknown): string | null {
 
 function stringArray(value: unknown): string[] {
   return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
+}
+
+/**
+ * The output names a contract permits, read the way the Core writes them.
+ *
+ * The Core's `intendedMutations` is a list of mutation *objects* -- `{ kind, target, operation,
+ * requiresTrustedExecution }` (engine.py `_intended_mutations`) -- and its own ingestion reads the
+ * output name out of `kind` (evidence/store.py). Reading this with the string-only helper filtered
+ * every object out, so `permittedOutputs` arrived as `[]`: the agent was told it could produce
+ * nothing, and the tool's own `permitted.size > 0` pre-check was skipped, since an empty set reads
+ * as "no restriction". A bare string is still accepted so an older Core is not refused outright,
+ * but anything else is refused rather than dropped -- losing an entry silently is the failure.
+ */
+function permittedOutputNames(value: unknown, runId: string): string[] {
+  if (value === null || value === undefined) return [];
+  if (!Array.isArray(value)) {
+    throw new BridgeError(
+      "BRIDGE_PROTOCOL_INCOMPATIBLE",
+      "BLOCKED_PLATFORM",
+      "the runtime's contract.intendedMutations is not a list; this bridge implements a different " +
+        "wire format than the Core it is talking to",
+      { runId },
+    );
+  }
+  return value.map((entry) => {
+    if (typeof entry === "string") {
+      if (entry.length === 0) {
+        throw new BridgeError(
+          "BRIDGE_PROTOCOL_INCOMPATIBLE",
+          "BLOCKED_PLATFORM",
+          "the runtime's contract.intendedMutations contains an empty output name",
+          { runId },
+        );
+      }
+      return entry;
+    }
+    const kind = typeof entry === "object" && entry !== null ? str((entry as Record<string, unknown>)["kind"]) : null;
+    if (kind === null) {
+      throw new BridgeError(
+        "BRIDGE_PROTOCOL_INCOMPATIBLE",
+        "BLOCKED_PLATFORM",
+        "the runtime's contract.intendedMutations contains a mutation with no kind, so the set of " +
+          "outputs this contract permits cannot be read; refusing it is safer than dropping it",
+        { runId },
+      );
+    }
+    return kind;
+  });
 }
 
 /** The id inside a `providerRef` such as `{ provider, kind, id }`, or null. */
@@ -454,7 +502,7 @@ function toolRuntimeFor(company: CompanyContext): ToolRuntime {
       }
 
       const requiredInputs = stringArray(contract["inputs"] ? Object.keys(contract["inputs"] as object) : []);
-      const permittedOutputs = stringArray(contract["intendedMutations"]);
+      const permittedOutputs = permittedOutputNames(contract["intendedMutations"], runId);
       const evidenceRequirements = Array.isArray(contract["requiredEvidenceKinds"])
         ? (contract["requiredEvidenceKinds"] as unknown[])
         : [];
@@ -1347,6 +1395,30 @@ function registerIntentHandlers(
     });
   };
 
+  const acknowledgeCoreEffect = async (
+    company: CompanyContext,
+    row: DeliveryRowLike,
+    payload: Record<string, unknown>,
+    state: "observed" | "delivered" | "reconciled" | "failed" | "ambiguous_create",
+    receipt?: Record<string, unknown>,
+  ): Promise<void> => {
+    const coreIntentId = str(payload["coreIntentId"]);
+    if (coreIntentId === null || company.runtime === null) return;
+    const scope = scopeForIntent(company, row);
+    if (scope === null) {
+      throw new BridgeError(
+        "BRIDGE_SCOPE_VIOLATION",
+        "BLOCKED_SCOPE",
+        "the platform effect completed but its Core receipt has no project scope",
+        { coreIntentId, runId: row.runId },
+      );
+    }
+    await company.runtime.markDelivery(SYSTEM_ACTOR, scope, coreIntentId, {
+      state,
+      ...(receipt === undefined ? {} : { receipt }),
+    });
+  };
+
   coreCall(INTENT_KINDS.workOrderCreate, async (company, payload, row) => {
     const declared = readJson(typeof payload["scope"] === "string" ? payload["scope"] : JSON.stringify(payload["scope"] ?? {}));
     const scope: Scope = {
@@ -1454,7 +1526,64 @@ function registerIntentHandlers(
       idempotencyKey: row.effectKey,
       correlationId: row.correlationId,
     });
-    return { status: "reconciled", result: { ref }, receiptRef: ref.id };
+    const scope = payload["scope"] as Scope;
+    const requirement: WorkerRequirement = {
+      scope,
+      runId: String(payload["runId"] ?? ""),
+      nodeId: String(payload["nodeId"] ?? ""),
+      requiredCapabilities: stringArray(payload["requiredCapabilities"]),
+      preferredRoles: stringArray(payload["preferredRoles"]),
+      fallbackRoles: stringArray(payload["fallbackRoles"]),
+      independentFrom: Array.isArray(payload["independentFrom"])
+        ? (payload["independentFrom"] as WorkerRequirement["independentFrom"])
+        : [],
+      excludeSubjects: stringArray(payload["excludeSubjects"]),
+    };
+    const candidates = await company.ports.work.resolveWorker(requirement);
+    const worker = candidates[0];
+    if (worker === undefined) {
+      return {
+        status: "retry",
+        result: { ref },
+        reason: `no eligible worker for ${requirement.requiredCapabilities.join(", ") || "this node"}`,
+        retryAfterMs: 30_000,
+      };
+    }
+    const iteration = typeof payload["iteration"] === "number" ? payload["iteration"] : 0;
+    const receipt = await company.ports.work.assignAndWake(
+      {
+        scope,
+        runId: requirement.runId,
+        nodeId: requirement.nodeId,
+        iteration,
+        // The Core creates the fenced attempt when the woken worker calls current/claim. This id
+        // identifies the pre-claim dispatch and is deliberately deterministic for replay.
+        attemptId: `dispatch:${requirement.runId}:${requirement.nodeId}:${iteration}`,
+        workUnitRef: ref,
+        workerSubjectRef: worker.subjectRef,
+        workspaceRef: null,
+        contractHash: "",
+      },
+      {
+        commandId: `${row.effectKey}:dispatch`,
+        idempotencyKey: `${row.effectKey}:dispatch`,
+        correlationId: row.correlationId,
+      },
+    );
+    if (!receipt.queued) {
+      return {
+        status: "retry",
+        result: { ref, dispatch: receipt },
+        reason: receipt.reason ?? "the platform did not queue a wakeup",
+        retryAfterMs: 30_000,
+      };
+    }
+    await acknowledgeCoreEffect(company, row, payload, "delivered", {
+      providerRef: ref,
+      workUnitRef: ref,
+      dispatch: receipt,
+    });
+    return { status: "reconciled", result: { ref, dispatch: receipt }, receiptRef: ref.id };
   });
 
   handler(INTENT_KINDS.workUnitDispatch, async (row): Promise<DeliveryOutcome> => {
@@ -1466,6 +1595,9 @@ function registerIntentHandlers(
       idempotencyKey: row.effectKey,
       correlationId: row.correlationId,
     });
+    if (receipt.queued) {
+      await acknowledgeCoreEffect(company, row, payload, "delivered", { dispatch: receipt });
+    }
     return receipt.queued
       ? { status: "reconciled", result: receipt }
       : { status: "observed", result: receipt, reason: receipt.reason ?? "the platform did not queue a wakeup" };
@@ -1480,6 +1612,10 @@ function registerIntentHandlers(
       idempotencyKey: row.effectKey,
       correlationId: row.correlationId,
     });
+    await acknowledgeCoreEffect(company, row, payload, "delivered", {
+      target: payload["target"],
+      projectionSequence: payload["projectionSequence"],
+    });
     return { status: "reconciled" };
   });
 
@@ -1492,6 +1628,9 @@ function registerIntentHandlers(
       idempotencyKey: row.effectKey,
       correlationId: row.correlationId,
     });
+    if (receipt.outcome !== "unknown") {
+      await acknowledgeCoreEffect(company, row, payload, "delivered", { stop: receipt });
+    }
     // `unknown` is a legitimate durable answer, not a failure. It becomes an ambiguous delivery
     // so the reconciler keeps looking, and the Core is told the effect outcome is unknown.
     return receipt.outcome === "unknown"
@@ -1508,6 +1647,7 @@ function registerIntentHandlers(
       idempotencyKey: row.effectKey,
       correlationId: row.correlationId,
     });
+    await acknowledgeCoreEffect(company, row, payload, "delivered", { artifact: published });
     return { status: "reconciled", result: published, receiptRef: published.providerRef.id };
   });
 
@@ -1520,6 +1660,7 @@ function registerIntentHandlers(
       idempotencyKey: row.effectKey,
       correlationId: row.correlationId,
     });
+    await acknowledgeCoreEffect(company, row, payload, "delivered", { providerRef: ref });
     return { status: "observed", result: { ref }, reason: "awaiting_human" };
   });
 
@@ -1532,6 +1673,41 @@ function registerIntentHandlers(
       payload["action"] as never,
     );
     return { status: "reconciled", result: status };
+  });
+
+  handler(INTENT_KINDS.migrationApplied, async (row): Promise<DeliveryOutcome> => {
+    const company = resolveCompany(row.companyId);
+    if (company === null) return { status: "observed", reason: "no company context", retryAfterMs: 60_000 };
+    const payload = readJson(row.payloadJson);
+    const successorRunId = str(payload["successorRunId"]);
+    const sourceRunId = str(payload["sourceRunId"]);
+    if (successorRunId === null || sourceRunId === null) {
+      return { status: "failed", reason: "a migration receipt must name its source and successor runs" };
+    }
+    const scope = scopeForIntent(company, row);
+    if (scope === null) {
+      return { status: "retry", reason: "migration receipt has no project scope", retryAfterMs: 30_000 };
+    }
+    company.store.putBinding({
+      companyId: company.companyId,
+      kind: "migration",
+      providerId: successorRunId,
+      projectId: scope.projectRef,
+      payload: {
+        sourceRunId,
+        successorRunId,
+        targetGraphVersion: payload["targetGraphVersion"],
+        planHash: payload["planHash"],
+        invalidatedPasses: payload["invalidatedPasses"],
+        correlationId: row.correlationId,
+      },
+    });
+    await acknowledgeCoreEffect(company, row, payload, "delivered", {
+      sourceRunId,
+      successorRunId,
+      targetGraphVersion: payload["targetGraphVersion"],
+    });
+    return { status: "reconciled", result: { sourceRunId, successorRunId } };
   });
 
   handler(INTENT_KINDS.coreDeliveryAck, async (row): Promise<DeliveryOutcome> => {

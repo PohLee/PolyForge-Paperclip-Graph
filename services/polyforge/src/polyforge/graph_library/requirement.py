@@ -32,7 +32,14 @@ _DEFINITION: Final[dict[str, Any]] = {
                 "preferredRoles": ["product"],
             },
             "startNodes": ["clarify"],
-            "exports": ["clarified_requirements", "analysis_findings", "requirement_baseline", "requirement_acceptance"],
+            "exports": [
+                "clarified_requirements",
+                "analysis_findings",
+                "requirement_baseline",
+                "requirement_spec",
+                "acceptance_criteria_review",
+                "requirement_acceptance",
+            ],
         }
     },
     "nodes": {
@@ -62,8 +69,22 @@ _DEFINITION: Final[dict[str, Any]] = {
             "operation": {"id": "requirement.baseline", "version": 1},
             "executor": {"requiredCapabilities": ["requirement.baseline"], "preferredRoles": ["product"]},
             "inputs": {"analysis": "analysis_findings"},
-            "produces": ["requirement_baseline"],
+            "produces": ["requirement_baseline", "requirement_spec"],
             "timeoutSeconds": 7200,
+            "retryBudget": {"maxAttempts": 2},
+        },
+        "acceptance_review": {
+            "id": "acceptance_review",
+            "kind": "agent_operation",
+            "operation": {"id": "requirement.review", "version": 1},
+            "executor": {
+                "requiredCapabilities": ["requirement.review"],
+                "preferredRoles": ["product"],
+                "independentFrom": ["requirement.producer"],
+            },
+            "inputs": {"requirement": "requirement_spec"},
+            "produces": ["acceptance_criteria_review"],
+            "timeoutSeconds": 3600,
             "retryBudget": {"maxAttempts": 2},
         },
         "requirement_gate": {
@@ -78,7 +99,8 @@ _DEFINITION: Final[dict[str, Any]] = {
     "edges": [
         {"from": "clarify", "to": "analyze"},
         {"from": "analyze", "to": "baseline"},
-        {"from": "baseline", "to": "requirement_gate"},
+        {"from": "baseline", "to": "acceptance_review"},
+        {"from": "acceptance_review", "to": "requirement_gate"},
         {"from": "requirement_gate", "to": "clarify", "guard": "rework"},
     ],
     "policyRefs": [

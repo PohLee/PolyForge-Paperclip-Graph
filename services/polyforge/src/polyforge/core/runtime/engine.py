@@ -1433,6 +1433,11 @@ class RuntimeEngine:
             node_plan = plan.nodes[node_id]
             iteration = int(self._node_row(run_id, node_id)["iteration"])
             correlation_key = f"work-unit:{run_id}:{node_id}:{iteration}"
+            independent_subjects = (
+                sorted(self._upstream_producer_subjects(run_id, plan, node_id, scope))
+                if node_plan.independent_from
+                else []
+            )
             self._outbox(
                 run=run,
                 kind="work.unit.ensure",
@@ -1449,6 +1454,13 @@ class RuntimeEngine:
                         f"v{plan.graph_version}."
                     ),
                     "requiredCapabilities": list(node_plan.required_capabilities),
+                    "preferredRoles": list(node_plan.preferred_roles),
+                    "fallbackRoles": list(node_plan.fallback_roles),
+                    "independentFrom": [
+                        {"capabilityRef": capability, "subjectRefs": independent_subjects}
+                        for capability in node_plan.independent_from
+                    ],
+                    "excludeSubjects": independent_subjects,
                     "correlationKey": correlation_key,
                     "parentIssueRef": loads(run.get("root_issue_ref_json"), None),
                     "workspaceRequirement": dict(node_plan.workspace_requirement or {}),
@@ -2065,6 +2077,20 @@ class RuntimeEngine:
         agent_subject = str(request.get("agentSubject", ""))
         if not agent_subject:
             raise errors.bad_request("agentSubject is required; a claim has no anonymous owner")
+        plan = self._plan(run)
+        node_plan = self._plan_node(plan, node_id)
+        if node_plan.independent_from:
+            upstream_subjects = self._upstream_producer_subjects(run_id, plan, node_id, scope)
+            if agent_subject in upstream_subjects:
+                raise errors.authorization_denied(
+                    f"subject {agent_subject!r} produced upstream work and cannot claim the "
+                    f"independent node {node_id!r}",
+                    runId=run_id,
+                    nodeId=node_id,
+                    subject=agent_subject,
+                    independentFrom=list(node_plan.independent_from),
+                    upstreamProducerSubjects=sorted(upstream_subjects),
+                )
         agent_run_ref = request.get("agentRunRef")
         if agent_run_ref is not None and (
             not isinstance(agent_run_ref, Mapping) or not agent_run_ref.get("id")
@@ -3330,6 +3356,39 @@ class RuntimeEngine:
             return None
         return loads(row["resolution_json"], None)
 
+    def _upstream_producer_subjects(
+        self,
+        run_id: str,
+        plan: ExecutionPlan,
+        node_id: str,
+        scope: Scope,
+    ) -> set[str]:
+        """Trusted subjects that authored any normal-dependency ancestor of ``node_id``.
+
+        ``independentFrom`` is enforced against persisted assignments and evidence provenance,
+        never against a caller-supplied author field.  All ancestors are included because join
+        nodes deliberately carry the lineage of their contributing branches.
+        """
+        upstream = set(plan.ancestors(node_id))
+        subjects: set[str] = set()
+        for row in self._node_rows(run_id):
+            upstream_node_id = str(row["node_id"])
+            if upstream_node_id not in upstream:
+                continue
+            assigned = str(row.get("assigned_subject") or "")
+            if assigned:
+                subjects.add(assigned)
+            for evidence in self.evidence.list_for_node(
+                company_ref=scope.company_ref,
+                project_ref=scope.project_ref,
+                run_id=run_id,
+                node_id=upstream_node_id,
+            ):
+                producer = str(evidence.get("producer_subject") or "")
+                if producer:
+                    subjects.add(producer)
+        return subjects
+
     def _evaluation_context(
         self,
         *,
@@ -3356,21 +3415,8 @@ class RuntimeEngine:
         node_id = str(node_row["node_id"])
         plan = self._plan(run)
         node_rows = self._node_rows(run_id)
-        upstream = set(plan.predecessors(node_id))
-        producers: set[str] = set()
-        for row in node_rows:
-            if str(row["node_id"]) not in upstream:
-                continue
-            for evidence in self.evidence.list_for_node(
-                company_ref=scope.company_ref,
-                project_ref=scope.project_ref,
-                run_id=run_id,
-                node_id=str(row["node_id"]),
-            ):
-                producers.add(str(evidence["producer_subject"]))
-        for row in node_rows:
-            if str(row["node_id"]) in upstream and row.get("assigned_subject"):
-                producers.add(str(row["assigned_subject"]))
+        upstream = set(plan.ancestors(node_id))
+        producers = self._upstream_producer_subjects(run_id, plan, node_id, scope)
         creator_row = self.db.query_one(
             "SELECT interaction_creator FROM governance_bindings WHERE run_id = ? AND node_id = ?"
             " ORDER BY created_at DESC LIMIT 1",
@@ -3399,9 +3445,9 @@ class RuntimeEngine:
                 )
                 if not bool(r["valid"])
             ),
-            # Predecessors' valid evidence, for a check that judges work this node did not do. Only
-            # direct predecessors, and only valid records: widening this to the whole run would let a
-            # gate accept a model authored two nodes away by a subject it never depended on.
+            # Valid evidence from the immutable normal-dependency lineage. A deterministic join
+            # carries no evidence of its own, so limiting this to the direct predecessor would hide
+            # the QA, security and regression reports the join exists to collect.
             upstream_evidence=tuple(
                 EvidenceRecord.from_row(r).to_wire()
                 for predecessor in sorted(upstream)
@@ -3674,6 +3720,7 @@ class RuntimeEngine:
             payload={
                 "runId": run_id,
                 "nodeId": node_id,
+                "iteration": int(node_row["iteration"]),
                 "status": str(NodeStatus.PASSED),
                 "summary": f"{node_id} passed transition {contract['contractHash']}",
                 "stateVersion": int(run["state_version"]) + 1,
@@ -3868,6 +3915,7 @@ class RuntimeEngine:
             payload={
                 "runId": run_id,
                 "nodeId": node_id,
+                "iteration": int(node_row["iteration"]),
                 "status": str(status),
                 "summary": aggregated.reason,
                 "stateVersion": int(run["state_version"]) + 1,

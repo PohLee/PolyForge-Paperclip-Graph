@@ -54,6 +54,7 @@ import {
   type ActionResult,
   type BridgeFailure,
 } from "../hooks/usePolyForge.js";
+import { buildPublishRequest, readPublishedVersion, reviewAttestationIsCurrent } from "./publish-contract.js";
 
 // ---------------------------------------------------------------------------
 // Pure helpers
@@ -243,7 +244,17 @@ export type StagedMap = {
  */
 export interface ReviewAttestation {
   readonly reviewer: string;
+  /**
+   * The exact target the Core recorded for this review -- the compile artifact's `planHash`.
+   * Publish must send this back verbatim; anything else is a different target.
+   */
   readonly targetHash: string;
+  /**
+   * The definition hash the review was taken against. This is what invalidates the review when the
+   * buffer is edited, and it is a different value from `targetHash` -- which is exactly why the two
+   * are separate fields and why publish does not send this one as the review target.
+   */
+  readonly definitionHash: string;
   readonly planHash: string;
   readonly attestedAt: string;
 }
@@ -320,6 +331,8 @@ export function publishGate(input: {
         diff.removedEdges.length +
         diff.policyChanges.length;
 
+  const reviewValidity = reviewAttestationIsCurrent(review, savedDefinitionHash, artifact?.planHash ?? null);
+
   const checks: PublishCheck[] = [
     {
       id: "clean",
@@ -368,20 +381,13 @@ export function publishGate(input: {
     {
       id: "review",
       label: "a review is attested against the exact target hash",
-      ok:
-        review !== null &&
-        savedDefinitionHash !== null &&
-        review.targetHash === savedDefinitionHash &&
-        artifact !== null &&
-        review.planHash === artifact.planHash,
-      detail:
-        review === null
-          ? "no review attested"
-          : review.targetHash !== savedDefinitionHash
-            ? `attested against ${review.targetHash}, but the current definition hashes to ${savedDefinitionHash}`
-            : artifact === null || review.planHash !== artifact.planHash
-              ? "the attested plan hash is not the current compile artifact's plan hash"
-              : `${review.reviewer} attested ${review.targetHash}`,
+      // Two separate questions, and they are not the same one. The review must still describe the
+      // definition as it stands now (so an edit since the review invalidates it), and it must have
+      // been taken against the plan that is being published (so the Core's comparison against the
+      // recorded review will hold). Comparing the review's target to the definition hash answered
+      // the first question with the wrong pair of values and let the second go unasked.
+      ok: reviewValidity.ok,
+      detail: reviewValidity.ok ? `${review?.reviewer} attested plan ${review?.targetHash}` : reviewValidity.reason,
     },
   ];
 
@@ -850,7 +856,11 @@ export function useDraftEditor(draftId: string): DraftEditor {
         review: {
           value: {
             reviewer: stored.reviewer,
-            targetHash: baseDefinitionHash,
+            // What the Core recorded, read back from its own answer. This is the value publish must
+            // echo; it is not the definition hash, and writing the definition hash here is what
+            // made every publish a 409 against the review this call had just recorded.
+            targetHash: stored.targetHash,
+            definitionHash: baseDefinitionHash,
             planHash: artifact.planHash,
             attestedAt: stored.recordedAt,
           },
@@ -878,20 +888,16 @@ export function useDraftEditor(draftId: string): DraftEditor {
     }
     setPhase("publishing");
     setLastFailure(null);
-    const result = await publishAction.run({
-      draftId,
-      // All five values name the same definition. If any of them names a different one, the
-      // Core's compare-and-swap refuses and nothing is published.
-      //
-      // The revision is sent as a number, not a string. A draft revision is a monotonic integer and
-      // the Core compares it as one, so `String(baseRevision)` made every publish fail with
-      // "expectedRevision must be an integer" — the editor's normal path could never work.
-      expectedRevision: baseRevision,
-      definitionHash: baseDefinitionHash,
-      compilerVersion: artifact.compilerVersion,
-      planHash: artifact.planHash,
-      reviewTargetHash: review.targetHash,
-    });
+    const result = await publishAction.run(
+      buildPublishRequest({
+        draftId,
+        revision: baseRevision,
+        definitionHash: baseDefinitionHash,
+        compilerVersion: artifact.compilerVersion,
+        planHash: artifact.planHash,
+        reviewTargetHash: review.targetHash,
+      }),
+    );
     if (!result.ok) {
       if (result.failure.kind === "conflict") {
         setConflict({
@@ -906,16 +912,20 @@ export function useDraftEditor(draftId: string): DraftEditor {
       }
       return fail(result.failure, "The server refused to publish.");
     }
-    const command = readCommandResult(result.value);
-    if (command === null || !command.applied) {
+    // A successful publish answers with the immutable `GraphVersion` it created. It was being read
+    // as a `CommandResult`, where the absent `applied` field read as `false` -- so a publish that
+    // had created a version was reported to the user as a failure, and the editor was not reloaded
+    // and so did not show the version it had just made.
+    const version = readPublishedVersion(result.value);
+    if (version === null) {
       setLastMessage(
-        "The server answered without confirming that the publish was applied. Nothing is claimed as published.",
+        "The server's answer was not a published version this build can read. Nothing is claimed as published.",
       );
       setPhase("failed");
       return false;
     }
     setLastMessage(
-      `Published as an immutable version at state version ${command.stateVersion}. Activating it as the default is a separate, explicit action.`,
+      `Published ${version.graphId} v${version.version} (plan ${version.planHash}) as an immutable version. Activating it as the default is a separate, explicit action.`,
     );
     setPhase("published");
     reload();

@@ -202,6 +202,27 @@ class NoPassWithoutGateTests(EngineCase):
         self.assertEqual(self.node(QA_NODE)["status"], NodeStatus.PASSED)
 
 
+class IndependentClaimTests(EngineCase):
+    """AT-33: an independent review cannot be claimed by an upstream author."""
+
+    def test_the_upstream_author_cannot_claim_the_independent_review(self) -> None:
+        self.work(QA_NODE, "sub-qa", "qa_report", "qa-v1")
+        grant_capability(self.db, "sub-qa", "security.review")
+        with self.assertRaises(errors.PolyForgeError) as caught:
+            self.engine.claim(
+                claim_request(run_id=self.run_id, node_id=REVIEW_NODE, subject="sub-qa")
+            )
+        self.assertEqual(caught.exception.code, errors.ErrorCode.AUTHORIZATION_DENIED)
+        self.assertIn("cannot claim the independent node", caught.exception.message)
+
+    def test_a_different_qualified_subject_can_claim_the_independent_review(self) -> None:
+        self.work(QA_NODE, "sub-qa", "qa_report", "qa-v1")
+        attempt = self.engine.claim(
+            claim_request(run_id=self.run_id, node_id=REVIEW_NODE, subject="sub-security")
+        )
+        self.assertEqual(attempt["agentSubject"], "sub-security")
+
+
 class IdempotencyAndVersioningTests(EngineCase):
     def test_replaying_the_same_command_returns_the_recorded_result(self) -> None:
         attempt = self.engine.claim(
@@ -907,7 +928,7 @@ class IndependentReviewTests(EngineCase):
         ]
         return graph
 
-    def test_a_reviewer_who_produced_the_artifact_fails_the_gate(self) -> None:
+    def test_a_reviewer_who_produced_the_artifact_is_refused_at_claim(self) -> None:
         snapshot = self.engine.admit_work_order(
             work_order_request(
                 graph=self._review_graph(), start_intent_id="intent-with-independent-review"
@@ -916,42 +937,12 @@ class IndependentReviewTests(EngineCase):
         self.run_id = str(snapshot["runId"])
         grant_capability(self.db, "sub-qa", "security.review")
         self.work(QA_NODE, "sub-qa", "qa_report", "qa-v1")
-        attempt = self.engine.claim(
-            claim_request(run_id=self.run_id, node_id=REVIEW_NODE, subject="sub-qa")
-        )
-        art = artifact("security_review", "sec-v1")
-        self.engine.submit_artifacts(
-            envelope(
-                run_id=self.run_id,
-                node_id=REVIEW_NODE,
-                attempt_id=attempt["attemptId"],
-                lease_epoch=attempt["leaseEpoch"],
-                payload={"artifacts": [art]},
+        with self.assertRaises(errors.PolyForgeError) as caught:
+            self.engine.claim(
+                claim_request(run_id=self.run_id, node_id=REVIEW_NODE, subject="sub-qa")
             )
-        )
-        evidence = self.engine.submit_evidence(
-            envelope(
-                run_id=self.run_id,
-                node_id=REVIEW_NODE,
-                attempt_id=attempt["attemptId"],
-                lease_epoch=attempt["leaseEpoch"],
-                command_suffix="ev",
-                payload={"evidence": [evidence_for(art, "security_review")]},
-            )
-        )
-        result = self.engine.request_transition(
-            envelope(
-                run_id=self.run_id,
-                node_id=REVIEW_NODE,
-                attempt_id=attempt["attemptId"],
-                lease_epoch=attempt["leaseEpoch"],
-                command_suffix="tr",
-                payload={"evidenceIds": [str(evidence["resultRef"]).split(",")[0]]},
-            )
-        )
-        self.assertFalse(result["applied"])
-        self.assertEqual(result["status"], NodeStatus.REWORK_REQUIRED)
-        self.assertIn("produced the artifact under review", result["blockers"][0]["message"])
+        self.assertEqual(caught.exception.code, errors.ErrorCode.AUTHORIZATION_DENIED)
+        self.assertIn("cannot claim the independent node", caught.exception.message)
 
     def test_an_independent_qualified_reviewer_passes(self) -> None:
         snapshot = self.engine.admit_work_order(

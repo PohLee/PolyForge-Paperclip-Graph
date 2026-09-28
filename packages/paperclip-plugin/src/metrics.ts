@@ -42,6 +42,7 @@ export const COUNTER_NAMES = [
   "crossScopeDenials",
   // Core outbox: how the bridge is coping with what the Core asked it to deliver.
   "unknownCoreIntentKinds",
+  "unreadableCoreIntentPayload",
   "coreOutboxEnqueueFailed",
   "coreOutboxAckFailed",
   "controlPlaneUnavailable",
@@ -123,6 +124,7 @@ export class BridgeMetrics {
       artifactDigestMismatch: stored["artifactDigestMismatch"] ?? 0,
       crossScopeDenials: stored["crossScopeDenials"] ?? 0,
       unknownCoreIntentKinds: stored["unknownCoreIntentKinds"] ?? 0,
+      unreadableCoreIntentPayload: stored["unreadableCoreIntentPayload"] ?? 0,
       coreOutboxEnqueueFailed: stored["coreOutboxEnqueueFailed"] ?? 0,
       coreOutboxAckFailed: stored["coreOutboxAckFailed"] ?? 0,
       controlPlaneUnavailable: stored["controlPlaneUnavailable"] ?? 0,

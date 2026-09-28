@@ -32,6 +32,8 @@ export interface WorkUnitIntent {
 export interface StatusProjection {
   scope: Scope;
   runId: string;
+  /** Node iteration being projected; omitted by older senders and treated as iteration zero. */
+  iteration?: number;
   /** Monotonic projection sequence from the Core; used to drop stale projections. */
   projectionSequence: number;
   target: ProviderRefLike;

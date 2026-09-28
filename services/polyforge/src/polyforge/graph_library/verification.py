@@ -34,6 +34,7 @@ _DEFINITION: Final[dict[str, Any]] = {
             "exports": [
                 "qa_report",
                 "security_review_report",
+                "security_report",
                 "regression_report",
                 "verification_evidence_set",
                 "acceptance_decision",
@@ -61,7 +62,7 @@ _DEFINITION: Final[dict[str, Any]] = {
                 "independentFrom": ["code.producer"],
             },
             "inputs": {"candidate": "implementation_acceptance"},
-            "produces": ["security_review_report"],
+            "produces": ["security_review_report", "security_report"],
             "timeoutSeconds": 14400,
             "retryBudget": {"maxAttempts": 2},
         },

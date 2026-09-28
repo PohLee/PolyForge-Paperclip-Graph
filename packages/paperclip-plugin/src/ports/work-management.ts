@@ -327,7 +327,7 @@ export class WorkManagementPortImpl implements WorkManagementPort {
     const { ctx, store, config, logger, metrics, deliveries } = this.#deps;
     guardScope(projection.scope, { companyId: projection.scope.companyRef, projectId: projection.scope.projectRef }, "projectStatus", metrics);
 
-    const bindingId = workUnitBindingId(projection.runId, projection.target.id, 0);
+    const bindingId = workUnitBindingId(projection.runId, projection.target.id, projection.iteration ?? 0);
     const binding = store.getBinding(projection.scope.companyRef, WORK_UNIT_BINDING_KIND, bindingId);
     const issueId = binding ? String(safeJson(binding.payloadJson)["issueId"] ?? "") : projection.target.id;
     if (issueId.length === 0) {

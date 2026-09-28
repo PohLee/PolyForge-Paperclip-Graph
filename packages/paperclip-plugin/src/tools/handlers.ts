@@ -51,6 +51,7 @@ import type {
   ToolRuntime,
 } from "./register.js";
 import { CLAIM_BINDING_KIND } from "./register.js";
+import { BridgeError } from "../errors.js";
 
 interface ToolContext {
   readonly runCtx: ToolRunContext;
@@ -81,6 +82,43 @@ function stringArrayParam(params: Record<string, unknown>, key: string): string[
 
 function ok(envelope: ToolEnvelope, text: string): ToolResult {
   return { content: text, data: envelope };
+}
+
+/**
+ * One artifact reference on an evidence candidate, in the Core's own shape.
+ *
+ * The Core's ingestion admits an artifact only when it carries a well-formed sha256 `contentHash`
+ * and an immutable identity, and it resolves the reference by matching that `kind` + `contentHash`
+ * against an artifact registered earlier (`evidence/store.py`). A provider ref -- "this lives on
+ * some issue, at some id" -- is neither, and carries no digest, so evidence bearing one was refused
+ * as `content_hash_invalid` no matter what the worker had actually published. These three fields
+ * are what `submit_artifact` already returned from the verified record; passing them through keeps
+ * the digest the artifact port compared against the bytes.
+ */
+function evidenceArtifactRef(artifact: unknown): {
+  kind: string;
+  contentHash: string;
+  source: Record<string, unknown>;
+  providerRef: Record<string, unknown>;
+} {
+  const ref = asRecord(artifact);
+  const contentHash = typeof ref["contentHash"] === "string" ? ref["contentHash"] : "";
+  const kind = typeof ref["kind"] === "string" ? ref["kind"] : "";
+  if (contentHash.length === 0 || kind.length === 0) {
+    throw new BridgeError(
+      "BRIDGE_INTEGRITY_FAILURE",
+      "BLOCKED_STALE_INPUT",
+      "an evidence artifact must name its kind and the content hash of bytes that were registered " +
+        "by submit_artifact; a provider reference is not an identity and cannot be evidence",
+      { kind, hasContentHash: contentHash.length > 0 },
+    );
+  }
+  return {
+    kind,
+    contentHash,
+    source: asRecord(ref["source"]),
+    providerRef: asRecord(ref["providerRef"]),
+  };
 }
 
 /**
@@ -774,31 +812,43 @@ export function makeToolHandlers(deps: ToolHandlerDeps) {
     const contract = await readContract(runtime, context);
     if (!isContract(contract)) return contract;
 
+    // Built before the call so an artifact this shape cannot be reported against this run's
+    // contract, in the same envelope every other refusal in this file uses, rather than escaping
+    // as an exception the worker cannot read.
+    let evidence: Record<string, unknown>[];
+    try {
+      evidence = rawEvidence.map((entry) => {
+        const record = asRecord(entry);
+        const artifacts = Array.isArray(record["artifacts"]) ? record["artifacts"] : [];
+        return {
+          kind: typeof record["kind"] === "string" ? record["kind"] : "",
+          producerSubject: `agent:paperclip/${context.runCtx.agentId}`,
+          producerRunRef: { provider: "paperclip", kind: "agent_run", id: context.runCtx.runId },
+          artifacts: artifacts.map((artifact) => evidenceArtifactRef(artifact)),
+          detail: asRecord(record["detail"]),
+          inputRevisionBindings: asRecord(record["inputRevisionBindings"]),
+          // Nothing a tool submits is valid on arrival; ingestion decides.
+          valid: false,
+        };
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return refuse(
+        toolEnvelope({
+          runId: context.binding.runId,
+          stateVersion: contract.stateVersion,
+          status: "ARTIFACT_REFUSED",
+          blockers: [
+            { code: "BRIDGE_INTEGRITY_FAILURE", reason: "BLOCKED_STALE_INPUT", message },
+          ],
+        }),
+        message,
+      );
+    }
+
     const result = await runtime.submitEvidence(context.runCtx.companyId, context.binding.runId, {
       ...mutationEnvelope(context, contract, claim, nodeId),
-      payload: {
-        evidence: rawEvidence.map((entry) => {
-          const record = asRecord(entry);
-          const artifacts = Array.isArray(record["artifacts"]) ? record["artifacts"] : [];
-          return {
-            kind: typeof record["kind"] === "string" ? record["kind"] : "",
-            producerSubject: `agent:paperclip/${context.runCtx.agentId}`,
-            producerRunRef: { provider: "paperclip", kind: "agent_run", id: context.runCtx.runId },
-            artifacts: artifacts.map((artifact) => {
-              const ref = asRecord(artifact);
-              return {
-                provider: typeof ref["provider"] === "string" ? ref["provider"] : "paperclip",
-                kind: typeof ref["kind"] === "string" ? ref["kind"] : "issue_attachment",
-                id: typeof ref["id"] === "string" ? ref["id"] : "",
-              };
-            }),
-            detail: asRecord(record["detail"]),
-            inputRevisionBindings: asRecord(record["inputRevisionBindings"]),
-            // Nothing a tool submits is valid on arrival; ingestion decides.
-            valid: false,
-          };
-        }),
-      },
+      payload: { evidence },
     });
     return commandResultToToolResult(
       result,
