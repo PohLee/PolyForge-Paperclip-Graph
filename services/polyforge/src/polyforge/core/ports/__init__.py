@@ -1,0 +1,73 @@
+"""Ports: the provider-neutral boundary the Core declares and the bridge implements.
+
+Nothing in the Core above this package knows what Paperclip is. When a port is missing, the
+Runtime reports ``read_only``/``BLOCKED`` — never a silent success.
+"""
+
+from __future__ import annotations
+
+from polyforge.core.ports.base import (
+    ArtifactPort,
+    ArtifactUpload,
+    AuthorizationRequest,
+    AuthorizationStatus,
+    CommandMeta,
+    DecisionRequest,
+    DispatchBinding,
+    DispatchReceipt,
+    ExactAction,
+    ExecutionObservation,
+    GovernancePort,
+    InteractionRequest,
+    NullPorts,
+    ObservabilityPort,
+    Ports,
+    ProgressProjection,
+    StatusProjection,
+    StopReceipt,
+    VerifiedArtifact,
+    VerifiedResolution,
+    WorkerCandidate,
+    WorkerRequirement,
+    WorkManagementPort,
+    WorkUnitIntent,
+    WorkspaceBinding,
+    WorkspaceMode,
+    WorkspaceObservation,
+    WorkspacePort,
+    WorkspaceRequirement,
+    provider_ref,
+)
+
+__all__ = [
+    "ArtifactPort",
+    "ArtifactUpload",
+    "AuthorizationRequest",
+    "AuthorizationStatus",
+    "CommandMeta",
+    "DecisionRequest",
+    "DispatchBinding",
+    "DispatchReceipt",
+    "ExactAction",
+    "ExecutionObservation",
+    "GovernancePort",
+    "InteractionRequest",
+    "NullPorts",
+    "ObservabilityPort",
+    "Ports",
+    "ProgressProjection",
+    "StatusProjection",
+    "StopReceipt",
+    "VerifiedArtifact",
+    "VerifiedResolution",
+    "WorkerCandidate",
+    "WorkerRequirement",
+    "WorkManagementPort",
+    "WorkUnitIntent",
+    "WorkspaceBinding",
+    "WorkspaceMode",
+    "WorkspaceObservation",
+    "WorkspacePort",
+    "WorkspaceRequirement",
+    "provider_ref",
+]

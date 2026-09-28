@@ -1,0 +1,169 @@
+{
+  "$comment": "Phase 0 compatibility lock (docs/03-MIGRATION-ROLLOUT-ACCEPTANCE.md P0-3). Every value here is read from the machine that actually runs the pilot, not from a registry ref. `latest`/`master` is not a production value. Regenerate with `node ops/probe-host.mjs --write` and review the diff before shipping.",
+  "capturedAt": "2026-09-26",
+  "capturedBy": "ops/probe-host.mjs",
+
+  "paperclip": {
+    "release": "2026.916.1",
+    "commit": null,
+    "imageDigest": null,
+    "packageIntegrity": "installed under /home/pohlee/.npm/_npx/43414d9b790239bb (npx-resolved; no lockfile to pin)",
+    "deploymentMode": "local_trusted",
+    "deploymentExposure": "private",
+    "bind": "127.0.0.1:3100",
+    "notes": "commit and imageDigest are null because this instance is an npx install with no VCS metadata. A production deployment must replace both with real pinned values; the lock is not a support claim."
+  },
+
+  "pluginSdk": {
+    "package": "@paperclipai/plugin-sdk",
+    "version": "2026.916.1",
+    "distSha256": "81f749d4cfec2b35ebe25abe42c32b2c444110ab0aafd2078096f4fad713a066",
+    "distSha256Scope": "sha256 over the concatenation of every dist/**/*.js, sorted by path",
+    "manifestApiVersion": 1,
+    "minimumHostVersionDeclaredByPlugin": null,
+    "minimumHostVersionNote": "Deliberately absent. The host compares it against runtimeServices.instanceInfo.hostVersion, which its published CLI build leaves at the literal default \"0.0.0\" because the CI build-version stamp is not in the npm tarball. Capability gating is the enforced compatibility check instead: every host API the bridge uses is capability-checked, and a missing capability becomes a named refusal that disables the feature rather than weakening it."
+  },
+
+  "shared": { "package": "@paperclipai/shared", "version": "2026.916.1" },
+  "server": { "package": "@paperclipai/server", "version": "2026.916.1" },
+  "cli": { "package": "paperclipai", "version": "2026.916.1" },
+
+  "hermesAdapter": {
+    "package": "@paperclipai/hermes-paperclip-adapter",
+    "version": "2026.916.1",
+    "mode": "not_selected",
+    "notes": "Installed and present, but no mode was selected for the pilot. Paperclip remains the only runtime invoker regardless of which mode is chosen; the Core never spawns a worker."
+  },
+  "hermesRuntime": { "version": "unverified", "capabilitiesDigest": null },
+
+  "polyforge": {
+    "protocolVersion": 1,
+    "schemaVersion": 1,
+    "compilerVersion": "polyforge-compiler/1.0.0",
+    "coreSchemaId": "pf.core/2",
+    "package": "@polyforge/paperclip-plugin",
+    "packageVersion": "0.1.0"
+  },
+
+  "runtime": {
+    "language": "python",
+    "version": "3.14.4",
+    "dependencies": "stdlib only",
+    "store": "SQLite WAL",
+    "node": "26.8.2"
+  },
+
+  "deployment": {
+    "workspaceProvider": "metadata_only",
+    "workspaceProviderNotes": "The bridge reads project/execution workspace metadata only. It never provisions a worktree and never resolves an arbitrary path. Machine-level isolation is therefore NOT claimed: a worktree is not a sandbox.",
+    "toolGatewayProfile": "host_governed_only",
+    "toolGatewayNotes": "Tool calls made by an agent are governed by the host adapter. The bridge cannot prove egress or credential isolation, so no sensitive node is admitted under an unverified rail.",
+    "runtimeTransport": "direct",
+    "runtimeTransportNotes": "Pilot posture only, forced by known gap V-13: the host's governed HTTP client cannot reach a private address, and the pilot's Runtime Service is on 127.0.0.1. A production deployment must move the Runtime Service to an address the host will accept and set this back to \"governed\" so the host's SSRF guard and HTTP audit are in the request path again. The pilot's health report is `degraded` for exactly this reason and should never be read as `ready` while this is set."
+  },
+
+  "experimental": { "cases": false, "decisions": false, "pipelines": false },
+
+  "capabilityProbe": {
+    "script": "ops/probe-host.mjs",
+    "report": "ops/host-capability-report.json",
+    "policy": "an unsupported capability fails closed; a read-only display may degrade, execution authorization / identity / durable reconciliation may not"
+  },
+
+  "knownGaps": [
+    {
+      "id": "V-01",
+      "question": "Is the host's own version reported to a plugin comparable?",
+      "status": "host_packaging_gap",
+      "answer": "No. `@paperclipai/server/dist/app.js` sets `instanceInfo.hostVersion` to opts.hostVersion ?? \"0.0.0\", and the published CLI tarball has no `.paperclip-build-version` stamp for the CLI to pass. `GET /api/health` reports 2026.916.1 correctly, but the value a plugin install compares against is 0.0.0.",
+      "consequence": "the manifest declares no minimumHostVersion, because a floor compared against 0.0.0 is not a check. Compatibility is enforced by capability gating at runtime, and ops/probe-host.mjs re-probes on every upgrade."
+    },
+    {
+      "id": "V-02",
+      "question": "Is Issue create/wakeup natively idempotent, and can a timed-out create be looked up?",
+      "status": "mitigated",
+      "answer": "The host offers no native idempotency key for issue creation. The bridge therefore looks up by (originKind, originId) before creating and records a delivery as `ambiguous` rather than blindly re-sending. This is a lookup-based reconciliation, not exactly-once.",
+      "consequence": "an ambiguous create is reconciled by correlation key; a duplicate is impossible because the pre-create lookup is authoritative"
+    },
+    {
+      "id": "V-03",
+      "question": "Which events actually fire, are they durable, is there a replay cursor?",
+      "status": "partially_verified",
+      "answer": "The subscribed event set is the documented one. Durability is not assumed: the bridge persists every observation to its own inbox before forwarding, and a periodic reconcile re-reads authoritative objects for active bindings.",
+      "consequence": "a lost event converges through reconciliation, not through replay"
+    },
+    {
+      "id": "V-04",
+      "question": "How is a workspace created, reused, cleaned up, and what is real isolation?",
+      "status": "read_only_verified",
+      "answer": "Only metadata reads are available to a plugin. Provisioning and cleanup are the host's.",
+      "consequence": "a parallel-writer lease cannot be enforced by the bridge; reviewers are declared read-only by contract, not by mechanism"
+    },
+    {
+      "id": "V-05",
+      "question": "What is the real authorization route for each sensitive action?",
+      "status": "no_first_class_route",
+      "answer": "There is no host path a plugin can use to *create* a privileged-action authorization. The bridge can read approvals but cannot mint one.",
+      "consequence": "every node whose contract requires a privileged action is BLOCKED_AUTHORIZATION rather than silently permitted. This is the correct fail-closed outcome, and it means deployment/release automation is out of scope for this pilot."
+    },
+    {
+      "id": "V-08",
+      "question": "Does the MCP/tool gateway cover the selected Hermes mode and its tool config?",
+      "status": "unverified",
+      "answer": "Not measured for this pilot because no Hermes mode was selected and no sensitive node is admitted.",
+      "consequence": "no node with an external side effect other than a governed Paperclip write is enabled"
+    },
+    {
+      "id": "V-10",
+      "question": "Are Cases/Decisions/Pipelines usable via SDK/REST/auth/flag?",
+      "status": "off",
+      "answer": "No first-class plugin client exists for them, so they stay behind flags that default to false. Root Issue plus a human-only Interaction is the only decision carrier.",
+      "consequence": "the MVP path is unaffected by their absence"
+    },
+    {
+      "id": "V-11",
+      "question": "Are Project/Issue/Agent/Run tabs all supported as plugin slots?",
+      "status": "verified",
+      "answer": "`detailTab` supports project, issue, agent, goal, and run; the plugin declares the four it needs.",
+      "consequence": "none"
+    },
+    {
+      "id": "V-12",
+      "question": "How does cost attribution relate to engineering budgets?",
+      "status": "split_by_design",
+      "answer": "Paperclip is the only financial ledger. The Core counts engineering attempts, reworks, and recursion separately and never maintains a competing cost ledger.",
+      "consequence": "none"
+    },
+    {
+      "id": "V-13",
+      "question": "Can a plugin reach a Runtime Service that is co-located on the same host?",
+      "status": "host_constraint_no_opt_out",
+      "answer": "No, not through the governed client. `ctx.http.fetch` resolves the target and refuses when every resolved address is loopback or RFC1918, throwing \"All resolved IPs for <host> are in private/reserved ranges\". The guard is unconditional: there is no per-plugin flag, no manifest key and no header that relaxes it, and the refusal happens before any request is made. Link-local and cloud-metadata addresses are refused as well. The host's own guard is therefore *stricter* than this plugin's, which permits loopback and RFC1918 only on an explicit `allowPrivateRuntimeHost` opt-in and still refuses link-local and metadata unconditionally.",
+      "consequence": "This is a deployment-topology requirement, not a configuration mistake: in production the Runtime Service must be reachable at an address the host will accept, which means a separate host or a routable address. The `runtimeTransport: \"direct\"` setting exists only so a single-host pilot can run at all. It is never a silent fallback: it cannot be enabled without the explicit config key, it is recorded in the bridge's durable state, and health reports it as a named issue that keeps the overall status `degraded` so an operator is never misled about which boundary is holding the request line. `governed` remains the default and is the production posture."
+    },
+    {
+      "id": "V-15",
+      "question": "Is a human graph review separable from a worker assertion when both share the bridge issuer?",
+      "status": "narrower_than_the_vocabulary_suggests",
+      "answer": "The Core enforces two real rules: a review from an agent or system assertion is refused outright, and an actor asserting `human` is only believed when it arrives from the issuer the service is configured with. What it cannot do is tell 'the bridge acting for a worker' from 'the bridge acting for a human', because the pilot's ops CLI and the plugin share one signing secret. So the human/agent separation rests on the bridge not forging the assertion, not on the Core detecting forgery.",
+      "consequence": "A worker that could obtain the shared secret could assert `human` and record a review. In production the human path signs as a different principal from the bridge, which closes this; the pilot records it rather than claiming the separation is already enforced. The plugin exposes no review action at all, so in practice publication is an operator action today."
+    },
+    {
+      "id": "V-16",
+      "question": "Can the Paperclip host be started through its own managed service in this environment?",
+      "status": "environment_blocked",
+      "answer": "No. `paperclipai run` refuses to start when `/home/pohlee/.paperclip/cli/install.json` is missing, and the documented repair, `paperclipai install --version 2026.916.1`, fails here: this environment's npm returns a JSON array where the installer expects an object, so it errors before writing anything. The unit additionally needs a `~/.local/bin/paperclipai` shim and a PATH containing the Node toolchain, neither of which a bare `service start` provides for a user systemd unit.",
+      "consequence": "The pilot starts the host with the command its own package defines (`node @paperclipai/server/dist/index.js`) and the environment the registered unit sets. The same server code runs and the instance data is untouched, but this is a workaround rather than a supported deployment path, and a production deployment must be started through a mechanism whose own preflight passes. The manifest was deliberately not hand-written: making doctor green without anything being installed would be a false green."
+    },
+    {
+      "id": "V-14",
+      "question": "Is the signed `path` relative to the API base, and is the actor normalised before signing?",
+      "status": "verified_and_fixed",
+      "answer": "Both are now verified against the live Core, and both were wrong in the bridge first. The signed `path` is the request target relative to the API base with the query string included, so `/v1/health` on the wire is signed as `/health`; the bridge originally signed the full `/v1/...` path. The actor is normalised to the Core's `to_wire()` form before signing, so an absent `agentId` and an explicit `agentId: null` produce the same bytes and an empty `roles` array is dropped rather than encoded; the bridge originally signed its actor object verbatim, including `agentId: null`, `runId: null` and `roles: []`. Either divergence fails every request with a bare \"the request signature does not verify against the received bytes\" and no indication of the cause.",
+      "consequence": "A cross-language fixture cannot catch this class of bug: both ends of a self-consistent wrong fixture agree with each other, so the original contract test passed while no real request could succeed. The signing logic now lives in one private method used by both the request path and the config-validation probe, and the tests assert against the string the *verifier* reconstructs from the transmitted headers rather than against a mirrored fixture."
+    }
+  ],
+
+  "contractTestReport": "reports/contract-suite.txt",
+  "verifiedAt": "2026-09-26"
+}

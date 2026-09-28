@@ -1,0 +1,27 @@
+# Line endings are pinned rather than left to core.autocrlf, because the build runs shell scripts
+# and Python from a Windows checkout inside WSL. A CRLF shell script fails with an unhelpful
+# "$'\r': command not found" that points nowhere near the real cause, so the fix is to store LF and
+# only relax it for the file formats where CRLF is genuinely part of the format.
+
+* text=auto eol=lf
+
+# Windows-native sources: CRLF is the format, and these are not executed by the WSL build.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# Binaries, and the formats git must not touch.
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.ico  binary
+*.pdf  binary
+*.zip  binary
+*.gz   binary
+*.sqlite3 binary
+*.sqlite3-wal binary
+*.sqlite3-shm binary
+
+# The plugin bundle is built, never committed; the ignore is belt-and-braces with .gitignore.
+packages/*/dist/** binary

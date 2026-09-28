@@ -1,0 +1,22 @@
+{
+  "name": "polyforge-paperclip",
+  "private": true,
+  "version": "0.1.0",
+  "description": "PolyForge engineering-graph core + Paperclip control-plane bridge plugin",
+  "type": "module",
+  "license": "Apache-2.0",
+  "engines": {
+    "node": ">=24.11.0"
+  },
+  "workspaces": [
+    "packages/protocol",
+    "packages/paperclip-plugin"
+  ],
+  "scripts": {
+    "build": "npm run build --workspace @polyforge/protocol && npm run build --workspace @polyforge/paperclip-plugin",
+    "typecheck": "npm run typecheck --workspace @polyforge/protocol && npm run typecheck --workspace @polyforge/paperclip-plugin",
+    "test": "npm run test --workspace @polyforge/paperclip-plugin",
+    "probe": "node ops/probe-host.mjs",
+    "verify": "node ops/verify.mjs"
+  }
+}
