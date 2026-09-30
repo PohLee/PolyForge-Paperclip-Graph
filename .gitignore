@@ -1,6 +1,8 @@
 node_modules/
 dist/
 build/
+.tmp/
+.paperclip/
 *.tsbuildinfo
 __pycache__/
 *.py[cod]
@@ -17,3 +19,4 @@ var/
 !.env.example
 coverage/
 reports/
+ops/host-capability-report.json
