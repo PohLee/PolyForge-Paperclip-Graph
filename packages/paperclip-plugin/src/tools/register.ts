@@ -57,12 +57,22 @@ export interface ToolHandlerDeps {
   /** Durable ids an agent run is bound to. */
   bindingForAgentRun(companyId: string, agentRunId: string): ToolRunBinding | null;
   /**
-   * Ask the work port to stop a previous owner's execution.
+   * Resolve an authenticated Paperclip execution through the host's current issue record.
+   * Used by the API fallback when requestWakeup did not return the eventual heartbeat id.
+   */
+  bindingForIssueExecution(
+    companyId: string,
+    issueId: string,
+    agentId: string,
+    agentRunId: string,
+  ): Promise<ToolRunBinding | null>;
+  /**
+   * Check whether the work port can confirm that a previous owner's execution has stopped.
    *
-   * Returns `"stopped"` only when the platform *confirmed* it (`confirmed_stopped`,
-   * `already_terminal`, `not_found`) and `"unknown"` otherwise. `current --adopt` refuses to
-   * proceed on `"unknown"`, because an unconfirmed stop is exactly the condition that lets two
-   * workers produce the same effect.
+   * This SDK baseline cannot terminate a live run. Returns `"stopped"` only when the platform
+   * *confirmed* it (`confirmed_stopped`, `already_terminal`, `not_found`) and `"unknown"` otherwise.
+   * `current --adopt` refuses to proceed on `"unknown"`, because an unconfirmed stop is exactly
+   * the condition that lets two workers produce the same effect.
    */
   stopPreviousOwner(companyId: string, ref: { provider: string; kind: string; id: string }): Promise<"stopped" | "unknown">;
   /** Metrics + counters for the company. */
@@ -216,6 +226,6 @@ export interface ToolArtifactInput {
   readonly contentHash: string;
   readonly mediaType: string;
   readonly size: number;
-  readonly source: { kind: "attachment" | "document" | "inline"; ref?: string; body?: string };
+  readonly source: { kind: "document" | "inline"; ref?: string; body?: string };
   readonly repository?: { repoRef: string; commit: string } | null;
 }

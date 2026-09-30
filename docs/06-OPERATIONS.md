@@ -15,6 +15,10 @@ that intermittently fails reads, and a running system must not depend on a mount
 tools/px.sh tools/<script>.sh [args…]
 ```
 
+`px.sh` canonicalizes `POLYFORGE_RUN_DIR` and refuses to copy or clean its `tools/` and `ops/`
+children unless the directory is strictly inside `PF_DATA_DIR`. Its path-safety regression test
+places a sentinel outside that root and verifies an unsafe override fails without deleting it.
+
 ---
 
 ## 1. One-time host preparation
@@ -57,6 +61,36 @@ tools/px.sh tools/stop-service.sh    # graceful stop; durable state untouched
 
 The service refuses to start without a non-empty shared secret.
 
+### Runtime database backup and restore
+
+The helper below operates on the PolyForge Runtime SQLite database only; it does not back up the
+Paperclip host database, bridge mappings, artifacts, or secrets. Take the backup through the native
+host path so the snapshot and its digest manifest are written to the host's durable data directory:
+
+```bash
+tools/px.sh tools/pf-db.sh backup
+tools/px.sh tools/pf-db.sh verify ~/.polyforge/backups/<backup-name>.sqlite
+```
+
+`backup` uses SQLite's online backup API, checks database integrity, and writes a SHA-256 JSON
+manifest beside the snapshot. Before restoring, stop Runtime yourself and retain the other
+cutover-state backups listed below. Restore does not stop a service: it refuses if the Runtime
+pidfile exists, the loopback health endpoint responds or cannot be proven unreachable, or SQLite
+WAL/SHM sidecars remain. It and the Runtime startup script share an OS file lock, so startup is
+refused while restore is in its offline-check/replacement window. Runtime startup therefore
+requires the host's `flock` utility. Restore also creates and verifies a pre-restore snapshot before
+replacing the database. Only after those checks should an operator run the explicit destructive command:
+
+```bash
+tools/px.sh tools/pf-db.sh restore --backup ~/.polyforge/backups/<backup-name>.sqlite --confirm-restore
+```
+
+This is an operator recovery aid, not evidence that the deployed host's complete backup/rollback
+procedure has been rehearsed. Never remove a stale pidfile or WAL sidecar merely to force a restore;
+first establish that no process owns the database and preserve the sidecar for investigation.
+Also keep the Runtime stopped and prevent external supervisors from restarting it until the command
+returns; the lock coordinates this repository's `run-service.sh`, not unrelated service managers.
+
 ## 3. Build, stage, install, provision
 
 ```bash
@@ -69,7 +103,21 @@ tools/px.sh tools/provision-pilot.sh <companyId>
 running worker depend on a mount that can drop, and ties a live install to files nobody audited.
 Staging copies exactly the artifacts the host loads and records their digests in
 `~/.polyforge/plugin/staged-build.json`, so an operator can tell one build from another without
-trusting a file name.
+trusting a file name. Re-staging retains the prior stage in a unique `.previous.*` directory rather
+than deleting the previous backup; if the final directory swap fails, the old stage is restored.
+Before uninstalling an existing plugin row, `install-plugin.sh` verifies the staged package identity
+and the worker, manifest, and UI digests; it also requires a healthy host, a readable plugin list,
+and a working CLI. If a plugin is already installed, preflight also requires its current package
+path/version/status to be readable, the old package files to be locally verifiable, and the old
+path to differ from the new stage. Otherwise replacement is refused before uninstall. After
+install, the script requires the host to report the exact staged path and version as `ready`; after
+an ambiguous CLI error it reconciles the installed path before retrying. A registered-but-not-ready
+stage is not blindly retried. If replacement fails, the script only removes a row that still points
+at the exact new stage and attempts to reinstall the previously verified package; an unexpected
+path or unreadable state stops for manual recovery. This restores plugin availability where the
+host permits it, but it is not a substitute for an exercised deployment rollback. The preflight
+and exact-path target checks are covered against a local fake Paperclip API; the live script has
+syntax validation only and has not been run against a Paperclip instance.
 
 `provision-pilot.sh` does three reversible things:
 
@@ -209,10 +257,17 @@ A rollback is not "restore the old database and run everything again".
 ## 8. Upgrade
 
 ```bash
-node ops/probe-host.mjs --json ops/host-capability-report.json --strict
+node ops/probe-host.mjs --json ops/host-capability-report.json
 ```
 
-then: build → typecheck → unit and contract suites → stage → install → provision → canary. A new
+By default this capability probe is read-only. The strict security verdict requires an explicit
+opt-in because the unauthenticated-write check sends a POST to `/api/plugins/install`; in
+`local_trusted` mode that request may be accepted and could cause a real install attempt. Only after
+reviewing the target and authorizing that check, run
+`node ops/probe-host.mjs --json ops/host-capability-report.json --strict --probe-unauthenticated-write`.
+The opt-in write probe is restricted to loopback Paperclip hosts.
+
+Then: build → typecheck → unit and contract suites → stage → install → provision → canary. A new
 manifest capability is a separate review. If the old version cannot read data written in the
 rollback window, do not upgrade production.
 

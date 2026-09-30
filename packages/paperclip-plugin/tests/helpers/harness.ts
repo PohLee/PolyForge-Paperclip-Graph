@@ -187,6 +187,7 @@ export class FakeRuntime {
         graphId: GRAPH_ID,
         name: "Test graph",
         entrypoints: { [ENTRYPOINT]: { key: ENTRYPOINT, startNodes: ["n1"] } },
+        nodePolicies: [],
         nodes: [],
         edges: [],
       },
@@ -426,7 +427,12 @@ export class FakeRuntime {
       return { status: 200, body: { graphs: [...this.graphs.values()] } };
     }
     if (method === "GET" && path.split("?")[0] === "/v1/runs") {
-      return { status: 200, body: { runs: [...this.runs.keys()].map((runId) => this.runSnapshot(runId)) } };
+      const scope = JSON.parse(Buffer.from(record.headers["x-pf-scope"] ?? "e30", "base64url").toString("utf8")) as Record<string, unknown>;
+      const projectRef = scope["projectRef"];
+      const runs = [...this.runs.keys()]
+        .map((runId) => this.runSnapshot(runId))
+        .filter((run) => (run["scope"] as Record<string, unknown> | undefined)?.["projectRef"] === projectRef);
+      return { status: 200, body: { runs } };
     }
     if (method === "GET" && path.startsWith("/v1/runs/") && path.split("?")[0]?.endsWith("/current") === true) {
       const base = path.split("?")[0] ?? "";
@@ -536,12 +542,9 @@ export class FakeRuntime {
   /**
    * The Core's lease, kept per (run, node, iteration).
    *
-   * A claim is only accepted when the caller presents the *current* epoch. A live lease held by a
-   * *different* agent run is refused outright — handing the epoch to whoever asks is not a fence,
-   * it is a race. Taking over a live lease is only possible once it has expired, which is the
-   * mechanism a crashed worker's claim is actually recovered by. Reproducing both here is what
-   * makes the fencing tests meaningful: a bridge that trusted only its own store would pass
-   * against a Runtime that never fences.
+   * A claim presents the *new* epoch. A different owner is refused unless the trusted bridge has
+   * a stop observation from the Paperclip work port; lease expiry by itself is not evidence that
+   * the old worker stopped. This mirrors RuntimeEngine._claim_tx rather than a bridge-side model.
    */
   #claimLease(path: string, body: Record<string, unknown>): RouteResult {
     const runId = decodeURIComponent(path.slice("/v1/runs/".length, -"/claims".length));
@@ -557,35 +560,35 @@ export class FakeRuntime {
     const agentRunRef = body["agentRunRef"] as { id?: unknown } | undefined;
     const caller = String(agentRunRef?.id ?? "");
 
-    if (presented !== currentEpoch) {
+    const replacingOwner = held !== undefined && held.agentRunId !== caller;
+    const priorWorkerState = body["priorWorkerState"];
+    if (replacingOwner && priorWorkerState !== "stopped" && priorWorkerState !== "fenced") {
+      this.claims.push({ ...body, granted: false, reason: "STOP_UNCONFIRMED", currentEpoch });
+      return {
+        status: 409,
+        body: {
+          error: {
+            code: "LEASE_FENCED",
+            message: "the previous worker must be confirmed stopped or fenced before takeover",
+          },
+          leaseEpoch: currentEpoch,
+        },
+      };
+    }
+    if (presented !== currentEpoch + 1) {
       this.claims.push({ ...body, granted: false, presentedLeaseEpoch: presented, currentEpoch });
       return {
         status: 409,
         body: {
           error: {
             code: "LEASE_FENCED",
-            message: `the attempt is at epoch ${currentEpoch}, not ${presented}`,
+            message: `the next lease epoch is ${currentEpoch + 1}, not ${presented}`,
           },
           leaseEpoch: currentEpoch,
         },
       };
     }
-    if (held !== undefined && held.agentRunId !== caller && !this.#leaseExpired(held)) {
-      this.claims.push({ ...body, granted: false, reason: "LEASE_HELD", currentEpoch });
-      return {
-        status: 409,
-        body: {
-          error: {
-            code: "LEASE_HELD",
-            message: `the attempt is held by ${held.agentRunId} until its lease expires`,
-          },
-          leaseEpoch: currentEpoch,
-          leaseExpiresAt: held.expiresAtMs,
-        },
-      };
-    }
-
-    const nextEpoch = currentEpoch + 1;
+    const nextEpoch = presented;
     const attemptId = `attempt-${nextEpoch}`;
     this.leases.set(key, {
       leaseEpoch: nextEpoch,
@@ -594,7 +597,14 @@ export class FakeRuntime {
       agentSubject: String(body["agentSubject"] ?? ""),
       expiresAtMs: this.nowMs() + this.leaseTtlMs,
     });
-    this.claims.push({ ...body, granted: true, presentedLeaseEpoch: presented, grantedEpoch: nextEpoch, attemptId });
+    this.claims.push({
+      ...body,
+      submittedAttemptId: body["attemptId"],
+      granted: true,
+      presentedLeaseEpoch: presented,
+      grantedEpoch: nextEpoch,
+      attemptId,
+    });
     const contract = this.contracts.get(runId);
     if (contract !== undefined) {
       this.contracts.set(runId, {
@@ -616,10 +626,6 @@ export class FakeRuntime {
         attemptId,
       },
     };
-  }
-
-  #leaseExpired(held: { expiresAtMs: number }): boolean {
-    return this.nowMs() >= held.expiresAtMs;
   }
 
   /** Age the Core's clock, so an expiring lease really expires. */
@@ -672,7 +678,7 @@ export class FakeRuntime {
             previousOwnerAgentRunId: held.agentRunId || null,
             startedAt: "2026-01-01T00:00:00.000Z",
             finishedAt: null,
-            leaseExpiresAt: null,
+            leaseExpiresAt: new Date(held.expiresAtMs).toISOString(),
             checkpointRef: null,
           };
 
@@ -881,7 +887,7 @@ export interface TestBridge {
   /** Drain every queued intent for this company through the real pump. */
   drain(): Promise<void>;
   counters(): Record<string, unknown>;
-  dispose(): void;
+  dispose(): Promise<void>;
 }
 
 /**
@@ -1015,6 +1021,17 @@ export async function buildBridge(options: BuildOptions = {}): Promise<TestBridg
         metrics,
         logger,
         company: (id: string) => companies.get(id) ?? null,
+        issueExecution: async (id: string, issueId: string) => {
+          const record = await harness.ctx.issues.get(issueId, id);
+          if (record === null) return null;
+          return {
+            companyId: record.companyId,
+            projectId: record.projectId,
+            assigneeAgentId: record.assigneeAgentId,
+            executionRunId: record.executionRunId,
+            status: record.status,
+          };
+        },
       }),
     );
     tools = registered;
@@ -1065,9 +1082,9 @@ export async function buildBridge(options: BuildOptions = {}): Promise<TestBridg
     counters() {
       return metrics.counters(companyId) as unknown as Record<string, unknown>;
     },
-    dispose() {
+    async dispose() {
       store.close();
-      void runtime.stop();
+      await runtime.stop();
       rmSync(tempDir, { recursive: true, force: true });
     },
   };
@@ -1228,6 +1245,7 @@ export function seedCapabilityBinding(
     {
       subjectRef,
       agentId,
+      projectRef: PROJECT_A,
       capabilities,
       roles: ["engineering"],
       independentSubjects: [],

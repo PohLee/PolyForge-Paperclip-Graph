@@ -1,6 +1,6 @@
 # PolyForge → Paperclip Migration Specification Pack
 
-版本：1.0 · 日期：2026-09-25 · 状态：实施基线提案，尚未实施或完成生产兼容性认证
+版本：1.0 · 日期：2026-09-25 · 状态：需求/设计基线；实现与验收进度见 [07 验收状态](07-VERIFICATION-STATUS.md)，尚未完成 Phase 0–4 或生产兼容性认证
 
 本文件组承接「了解 PaperClip 插件与治理」讨论，完整定义迁移后的产品需求、工程边界、接口方案、实施阶段和验收方式。正文使用中文，保留代码标识符与英文领域术语。
 
@@ -10,6 +10,8 @@
 2. [技术实施设计](02-TECHNICAL-PLAN.md)：模块、接口、数据模型、状态机、幂等、事件、执行、恢复与安全。
 3. [分期迁移、测试与上线手册](03-MIGRATION-ROLLOUT-ACCEPTANCE.md)：Phase 0–6、可执行工作包、验收用例、数据迁移、切换、回滚。
 4. [来源、兼容性与架构决策](04-SOURCES-AND-DECISIONS.md)：讨论来源、当前核查结果、现有代码衔接、假设、待验证项与 ADR。
+5. [当前实现与验收状态](07-VERIFICATION-STATUS.md)：按 Phase 列出实现、验证证据和未通过的真实宿主门槛。
+6. [Phase 0 源码/基础设施盘点](08-SOURCE-INVENTORY.md)：当前 checkout 的所有权、进程/数据库依赖与 legacy import 缺口。
 
 ## 已确定的架构方向
 

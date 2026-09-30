@@ -521,6 +521,7 @@ export interface ProjectView {
 
 export interface AgentCapabilityBinding {
   readonly agentId: string;
+  readonly projectRef: string | null;
   readonly runId: string | null;
   readonly nodeId: string | null;
   readonly capabilities: string[];
@@ -923,6 +924,7 @@ function narrowCapabilityBinding(value: unknown): AgentCapabilityBinding | null 
   if (!isRecord(value)) return null;
   return {
     agentId: str(value["agentId"], "not reported"),
+    projectRef: nullableStr(value["projectRef"]),
     runId: nullableStr(value["runId"]),
     nodeId: nullableStr(value["nodeId"]),
     capabilities: strArray(value["capabilities"]),

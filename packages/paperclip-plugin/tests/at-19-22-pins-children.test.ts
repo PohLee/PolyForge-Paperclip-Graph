@@ -24,10 +24,10 @@ const h = await load<typeof import("./helpers/harness.ts")>(new URL("./helpers/h
 
 const { COMPANY_A, PROJECT_A, GRAPH_ID, ENTRYPOINT, buildBridge, company, project, issue, label } = h;
 const bridges: { dispose(): void }[] = [];
-after(() => {
-  for (const bridge of bridges) bridge.dispose();
+after(async () => {
+  for (const bridge of bridges) await bridge.dispose();
 });
-function track<T extends { dispose(): void }>(bridge: T): T {
+function track<T extends { dispose(): Promise<void> }>(bridge: T): T {
   bridges.push(bridge);
   return bridge;
 }
@@ -157,6 +157,144 @@ test("AT-19: a child work unit records the run pin it was created under", async 
   assert.equal(payload["graphVersion"], 13);
   assert.equal((payload["pins"] as Record<string, unknown>)["graph"], `${GRAPH_ID}@13`);
   assert.equal(ref.kind, "issue");
+});
+
+test("a repo-backed child requests Paperclip isolation without inheriting a parent workspace", async () => {
+  const bridge = track(await withRun(13));
+  const create = bridge.ctx.issues.create.bind(bridge.ctx.issues);
+  let requested: Parameters<typeof bridge.ctx.issues.create>[0] | null = null;
+  bridge.ctx.issues.create = async (input) => {
+    requested = input;
+    return create(input);
+  };
+
+  await bridge.company.ports.work.ensureWorkUnit(
+    workUnit({
+      workspaceRequirement: {
+        mode: "read_write",
+        repositories: [{ repoRef: "https://example.invalid/repo.git", baseRef: "main", commit: "a".repeat(40) }],
+        requireReadOnlyForReviewer: false,
+      },
+    }),
+    META,
+  );
+
+  assert.ok(requested, "the host issue should be created");
+  assert.equal(requested.executionWorkspacePreference, "isolated_workspace");
+  assert.deepEqual(requested.executionWorkspaceSettings, { mode: "isolated_workspace" });
+  assert.equal("inheritExecutionWorkspaceFromIssueId" in requested, false);
+});
+
+test("repo-backed modes that cannot be enforced are refused before child creation", async () => {
+  const bridge = track(await withRun(13));
+  let createCount = 0;
+  const create = bridge.ctx.issues.create.bind(bridge.ctx.issues);
+  bridge.ctx.issues.create = async (input) => {
+    createCount += 1;
+    return create(input);
+  };
+
+  await assert.rejects(
+    () =>
+      bridge.company.ports.work.ensureWorkUnit(
+        workUnit({
+          workspaceRequirement: {
+            mode: "read_only_snapshot",
+            repositories: [{ repoRef: "https://example.invalid/repo.git", baseRef: "main", commit: "a".repeat(40) }],
+            requireReadOnlyForReviewer: true,
+          },
+        }),
+        META,
+      ),
+    /not implemented for repository work/,
+  );
+  assert.equal(createCount, 0, "unsupported read-only work must not leave a misleading runnable child");
+});
+
+test("a repo-backed work unit without a full commit pin is refused before child lookup or creation", async () => {
+  const bridge = track(await withRun(13));
+  let listCount = 0;
+  let createCount = 0;
+  const list = bridge.ctx.issues.list.bind(bridge.ctx.issues);
+  const create = bridge.ctx.issues.create.bind(bridge.ctx.issues);
+  bridge.ctx.issues.list = async (...args) => {
+    listCount += 1;
+    return list(...args);
+  };
+  bridge.ctx.issues.create = async (...args) => {
+    createCount += 1;
+    return create(...args);
+  };
+
+  await assert.rejects(
+    () =>
+      bridge.company.ports.work.ensureWorkUnit(
+        workUnit({
+          workspaceRequirement: {
+            mode: "read_write",
+            repositories: [{ repoRef: "https://example.invalid/repo.git", baseRef: "main" }],
+            requireReadOnlyForReviewer: false,
+          },
+        }),
+        META,
+      ),
+    /full Git commit pin/,
+  );
+  assert.equal(listCount, 0, "invalid repository intent must not attempt host-side dedupe/recovery");
+  assert.equal(createCount, 0, "invalid repository intent must not create a blocked child issue");
+});
+
+test("a replay repairs a legacy repo child with no workspace preference", async () => {
+  const legacyChild = h.issue("legacy-child", COMPANY_A, PROJECT_A, {
+    parentId: "root-1",
+    originKind: "plugin:polyforge:node",
+    originId: "run-1:n1:0",
+  });
+  const bridge = track(await withRun(13));
+  bridge.harness.seed({ issues: [legacyChild] });
+
+  await bridge.company.ports.work.ensureWorkUnit(
+    workUnit({
+      workspaceRequirement: {
+        mode: "read_write",
+        repositories: [{ repoRef: "https://example.invalid/repo.git", baseRef: "main", commit: "a".repeat(40) }],
+        requireReadOnlyForReviewer: false,
+      },
+    }),
+    META,
+  );
+
+  const repaired = await bridge.ctx.issues.get("legacy-child", COMPANY_A);
+  assert.equal(repaired?.executionWorkspacePreference, "isolated_workspace");
+  assert.deepEqual(repaired?.executionWorkspaceSettings, { mode: "isolated_workspace" });
+});
+
+test("a replay does not overwrite a conflicting workspace preference", async () => {
+  const conflictingChild = h.issue("conflicting-child", COMPANY_A, PROJECT_A, {
+    parentId: "root-1",
+    originKind: "plugin:polyforge:node",
+    originId: "run-1:n1:0",
+    executionWorkspacePreference: "shared_workspace",
+  });
+  const bridge = track(await withRun(13));
+  bridge.harness.seed({ issues: [conflictingChild] });
+
+  await assert.rejects(
+    () =>
+      bridge.company.ports.work.ensureWorkUnit(
+        workUnit({
+          workspaceRequirement: {
+            mode: "read_write",
+            repositories: [{ repoRef: "https://example.invalid/repo.git", baseRef: "main", commit: "a".repeat(40) }],
+            requireReadOnlyForReviewer: false,
+          },
+        }),
+        META,
+      ),
+    /conflicting workspace preference/,
+  );
+  const unchanged = await bridge.ctx.issues.get("conflicting-child", COMPANY_A);
+  assert.equal(unchanged?.executionWorkspacePreference, "shared_workspace");
 });
 
 test("AT-19: a security revocation still pauses the old run, pin or not", async () => {

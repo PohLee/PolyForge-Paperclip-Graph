@@ -17,14 +17,14 @@ import { load } from "./helpers/bootstrap.ts";
 const h = await load<typeof import("./helpers/harness.ts")>(new URL("./helpers/harness.ts", import.meta.url));
 const admission = await load<typeof import("../src/admission.ts")>(new URL("../src/admission.ts", import.meta.url));
 
-const { COMPANY_A, PROJECT_A, GRAPH_ID, ENTRYPOINT, buildBridge, company, project, issue, label, hostEvent } = h;
+const { COMPANY_A, PROJECT_A, GRAPH_ID, ENTRYPOINT, buildBridge, company, project, issue, label, workspace, hostEvent } = h;
 const bridges: { dispose(): void }[] = [];
 
-after(() => {
-  for (const bridge of bridges) bridge.dispose();
+after(async () => {
+  for (const bridge of bridges) await bridge.dispose();
 });
 
-function track<T extends { dispose(): void }>(bridge: T): T {
+function track<T extends { dispose(): Promise<void> }>(bridge: T): T {
   bridges.push(bridge);
   return bridge;
 }
@@ -148,6 +148,65 @@ test("AT-02: 100 replays of one start intent produce one work-order request and 
     companyRef: COMPANY_A,
     projectRef: PROJECT_A,
   });
+  const workOrderBody = JSON.parse(signed.bodyText) as Record<string, unknown>;
+  assert.deepEqual(workOrderBody["policyRules"], [
+    {
+      ruleId: `paperclip-admission:${decision.startIntentId}`,
+      effect: "allow",
+      projectRef: PROJECT_A,
+      workflowRef: GRAPH_ID,
+      transitionRef: `${GRAPH_ID}.${ENTRYPOINT}`,
+      actions: ["work_order.admit"],
+      resources: ["root-1"],
+      environments: ["production"],
+      reason: "a board user explicitly admitted this Paperclip issue into the named graph entrypoint",
+    },
+  ]);
+});
+
+test("AT-02: node execution policy is pinned only for Runtime-approved project capability subjects", async () => {
+  const bridge = track(await seed());
+  const graph = bridge.runtime.graphs.get(GRAPH_ID);
+  assert.ok(graph);
+  bridge.runtime.graphs.set(GRAPH_ID, {
+    ...graph,
+    nodePolicies: [
+      { nodeId: "clarify", requiredCapabilities: ["requirement.clarify"], eligibleSubjects: ["agent:paperclip/producer"] },
+      { nodeId: "review", requiredCapabilities: ["requirement.review"], eligibleSubjects: [] },
+    ],
+  });
+  const root = (await bridge.harness.ctx.issues.list({ companyId: COMPANY_A })).find((entry) => entry.id === "root-1");
+  assert.ok(root);
+  const decision = bridge.company.admission.evaluate(root, "user-1");
+  assert.equal(decision.admit, true);
+  if (!decision.admit) return;
+  await bridge.company.router.considerIssue(decision, {
+    actorType: "human",
+    actorId: "user-1",
+    agentId: null,
+    runId: null,
+    roles: [],
+  }, "corr-policy");
+  await bridge.drain();
+
+  const request = bridge.runtime.requestsTo("POST", "/v1/work-orders")[0];
+  assert.ok(request);
+  const policyRules = JSON.parse(request.bodyText)["policyRules"] as Record<string, unknown>[];
+  assert.equal(policyRules.length, 2, "the reviewer without a scoped Runtime capability grant gets no execution allow");
+  assert.deepEqual(policyRules[1], {
+    ruleId: `paperclip-capability:${GRAPH_ID}:clarify:agent:paperclip/producer`,
+    effect: "allow",
+    agentRef: "agent:paperclip/producer",
+    projectRef: PROJECT_A,
+    workflowRef: GRAPH_ID,
+    transitionRef: `${GRAPH_ID}.clarify`,
+    actions: ["node.clarify.execute"],
+    resources: ["clarify"],
+    environments: ["production"],
+    requiredCapabilities: ["requirement.clarify"],
+    version: "1",
+    reason: "the project-scoped Paperclip capability binding grants requirement.clarify to this subject",
+  });
 });
 
 test("AT-02: the start intent id is stable for the same issue, graph and entrypoint", async () => {
@@ -171,6 +230,8 @@ test("AT-02: an edited work-order intent block is a new intent, so a new run is 
     graphId: GRAPH_ID,
     entrypoint: ENTRYPOINT,
     inputSnapshot: { a: 1 },
+    workspaceRequirement: null,
+    requiredFactSources: {},
     startIntentId: null,
     rejectedFields: [] as string[],
   };
@@ -184,6 +245,108 @@ test("AT-02: an edited work-order intent block is a new intent, so a new run is 
     admission.deriveStartIntentId(scope, "root-1", GRAPH_ID, ENTRYPOINT, blockA),
     admission.deriveStartIntentId(scope, "root-1", GRAPH_ID, ENTRYPOINT, blockA),
   );
+  assert.notEqual(
+    admission.deriveStartIntentId(scope, "root-1", GRAPH_ID, ENTRYPOINT, {
+      ...blockA,
+      requiredFactSources: { design_acceptance: { sourceRunId: "run-design-a" } },
+    }),
+    admission.deriveStartIntentId(scope, "root-1", GRAPH_ID, ENTRYPOINT, {
+      ...blockA,
+      requiredFactSources: { design_acceptance: { sourceRunId: "run-design-b" } },
+    }),
+  );
+});
+
+test("AT-02: a code work-order carries one exact repository commit pin", async () => {
+  const bridge = track(await seed());
+  const commit = "a".repeat(40);
+  const requirement = {
+    mode: "read_write" as const,
+    repositories: [{ repoRef: "https://example.invalid/repo.git", baseRef: "refs/heads/main", commit }],
+    requireReadOnlyForReviewer: false,
+  };
+  const body = admission.renderWorkOrderIntentBlock({
+    graphId: GRAPH_ID,
+    entrypoint: ENTRYPOINT,
+    workspaceRequirement: requirement,
+  });
+  const parsed = admission.parseWorkOrderIntent(body, bridge.metrics, COMPANY_A, bridge.company.logger);
+  assert.deepEqual(parsed?.workspaceRequirement, requirement);
+
+  const blockA = { graphId: GRAPH_ID, entrypoint: ENTRYPOINT, inputSnapshot: {}, workspaceRequirement: requirement, startIntentId: null, rejectedFields: [] };
+  const blockB = { ...blockA, workspaceRequirement: { ...requirement, repositories: [{ ...requirement.repositories[0]!, commit: "b".repeat(40) }] } };
+  assert.notEqual(
+    admission.deriveStartIntentId({ companyRef: COMPANY_A, projectRef: PROJECT_A }, "root-1", GRAPH_ID, ENTRYPOINT, blockA),
+    admission.deriveStartIntentId({ companyRef: COMPANY_A, projectRef: PROJECT_A }, "root-1", GRAPH_ID, ENTRYPOINT, blockB),
+  );
+});
+
+test("AT-02: malformed repository pins are rejected instead of normalized into a weaker request", async () => {
+  const bridge = track(await seed());
+  const body = admission.renderWorkOrderIntentBlock({
+    graphId: GRAPH_ID,
+    entrypoint: ENTRYPOINT,
+    workspaceRequirement: {
+      mode: "read_write",
+      repositories: [{ repoRef: "https://example.invalid/repo.git", baseRef: "refs/heads/main", commit: "abc123" }],
+      requireReadOnlyForReviewer: false,
+    },
+  });
+  assert.equal(admission.parseWorkOrderIntent(body, bridge.metrics, COMPANY_A, bridge.company.logger), null);
+});
+
+test("AT-02: special object property names cannot poison the prerequisite-source map", async () => {
+  const bridge = track(await seed());
+  const body = [
+    "```polyforge:work-order",
+    '{"graphId":"requirements","entrypoint":"design.start","requiredFactSources":{"__proto__":{"sourceRunId":"run-source"}}}',
+    "```",
+  ].join("\n");
+  assert.equal(admission.parseWorkOrderIntent(body, bridge.metrics, COMPANY_A, bridge.company.logger), null);
+});
+
+test("AT-02: code work is admitted only with a pin matching the trusted project workspace", async () => {
+  const repo = workspace("workspace-a", PROJECT_A, COMPANY_A);
+  const bridge = track(await buildBridge({
+    seed: {
+      companies: [company(COMPANY_A)],
+      projects: [project(PROJECT_A, COMPANY_A)],
+      projectWorkspaces: [repo],
+      issues: [issue("root-code", COMPANY_A, PROJECT_A, { labels: [engineeringLabel] })],
+    },
+  }));
+  const graph = bridge.runtime.graphs.get(GRAPH_ID);
+  assert.ok(graph);
+  bridge.runtime.graphs.set(GRAPH_ID, {
+    ...graph,
+    nodePolicies: [{ nodeId: "edit", requiredCapabilities: ["code.modify"], eligibleSubjects: ["agent:paperclip/engineer"] }],
+  });
+  const requirement = {
+    mode: "read_write" as const,
+    repositories: [{ repoRef: repo.repoUrl, baseRef: repo.defaultRef, commit: "c".repeat(40) }],
+    requireReadOnlyForReviewer: false,
+  };
+  const requiredFactSources = { design_acceptance: { sourceRunId: "run-design-1" } };
+  const body = admission.renderWorkOrderIntentBlock({
+    graphId: GRAPH_ID,
+    entrypoint: ENTRYPOINT,
+    workspaceRequirement: requirement,
+    requiredFactSources,
+  });
+  const root = { ...(await bridge.harness.ctx.issues.get("root-code", COMPANY_A))!, description: body };
+  const decision = bridge.company.admission.evaluate(root, "user-1");
+  assert.equal(decision.admit, true);
+  if (!decision.admit) return;
+
+  await bridge.company.router.considerIssue(decision, {
+    actorType: "human", actorId: "user-1", agentId: null, runId: null, roles: [],
+  }, "corr-repo-pin");
+  await bridge.drain();
+  const request = bridge.runtime.requestsTo("POST", "/v1/work-orders")[0];
+  assert.ok(request);
+  const payload = JSON.parse(request.bodyText) as Record<string, unknown>;
+  assert.deepEqual(payload["workspaceRequirement"], requirement);
+  assert.deepEqual(payload["requiredFactSources"], requiredFactSources);
 });
 
 test("AT-02: a body intent admits, and scope or actor fields inside it are refused", async () => {

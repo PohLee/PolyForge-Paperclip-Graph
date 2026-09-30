@@ -15,12 +15,19 @@ from services.polyforge.tests.runtime.fixtures import (
     SCOPE_A,
     SCOPE_B,
     definition,
+    grant_capability,
     make_engine,
     node_state,
     work_order_request,
 )
 from polyforge.core import errors
+from polyforge.core.runtime.engine import RuntimeEngine
 from polyforge.core.state import GraphRunStatus, NodeStatus
+from polyforge.core.runtime.planner import build_plan
+from polyforge.core.store import loads
+from polyforge.graph_library.design import definition as design_definition
+from polyforge.graph_library.implementation import definition as implementation_definition
+from polyforge.graph_library.requirement import definition as requirement_definition
 
 
 def _count(db: object, table: str) -> int:
@@ -329,6 +336,166 @@ class AdmissionShapeTests(unittest.TestCase):
             work_order_request(start_intent_id="intent-b", graph=tampered)
         )
         self.assertNotEqual(first["pins"]["planHash"], second["pins"]["planHash"])
+
+
+class RunWorkspacePinTests(unittest.TestCase):
+    """Repository pins are exact, run-scoped inputs to code.modify plans."""
+
+    @staticmethod
+    def plan():
+        return build_plan(implementation_definition(), entrypoint="implementation.start")
+
+    @staticmethod
+    def requirement(commit: str = "a" * 40) -> dict[str, object]:
+        return {
+            "mode": "read_write",
+            "repositories": [{"repoRef": "https://example.invalid/repo.git", "baseRef": "refs/heads/main", "commit": commit}],
+            "requireReadOnlyForReviewer": False,
+        }
+
+    def test_code_modify_plan_requires_a_workspace_pin(self) -> None:
+        with self.assertRaises(errors.PolyForgeError) as caught:
+            self.engine_requirement(None)
+        self.assertEqual(caught.exception.code, errors.ErrorCode.CONTRACT_INVALID)
+        self.assertIn("code.modify", caught.exception.message)
+
+    def test_exact_pin_is_overlaid_on_every_code_node_and_changes_plan_hash(self) -> None:
+        plan = self.plan()
+        pinned = self.engine_requirement(self.requirement("A" * 40))
+        requirement = self.requirement()
+        self.assertNotEqual(pinned.plan_hash, plan.plan_hash)
+        for node_id in ("backend_impl", "frontend_impl"):
+            self.assertEqual(pinned.node(node_id).workspace_requirement, requirement)
+        self.assertIsNone(pinned.node("implementation_review").workspace_requirement)
+
+    def test_unpinned_or_malformed_commit_is_rejected(self) -> None:
+        for commit in (None, "a" * 39, "g" * 40):
+            with self.subTest(commit=commit), self.assertRaises(errors.PolyForgeError) as caught:
+                value = self.requirement()
+                value["repositories"] = [{"repoRef": "repo", "baseRef": "main", "commit": commit}]
+                self.engine_requirement(value)
+            self.assertEqual(caught.exception.code, errors.ErrorCode.CONTRACT_INVALID)
+
+    def test_unknown_fields_and_multiple_repositories_fail_closed(self) -> None:
+        extra = self.requirement()
+        extra["ambientAuthority"] = True
+        with self.assertRaises(errors.PolyForgeError):
+            self.engine_requirement(extra)
+        multiple = self.requirement()
+        multiple["repositories"] = multiple["repositories"] * 2
+        with self.assertRaises(errors.PolyForgeError):
+            self.engine_requirement(multiple)
+
+    def test_a_repository_pin_cannot_be_attached_to_a_non_code_graph(self) -> None:
+        plan = build_plan(definition(), entrypoint=ENTRYPOINT)
+        with self.assertRaises(errors.PolyForgeError) as caught:
+            RuntimeEngine._apply_run_workspace_requirement(plan, self.requirement())
+        self.assertEqual(caught.exception.code, errors.ErrorCode.CONTRACT_INVALID)
+
+    def engine_requirement(self, value):
+        return RuntimeEngine._apply_run_workspace_requirement(self.plan(), value)
+
+
+class RequiredFactSourceTests(unittest.TestCase):
+    """A fact receipt resolves only from a completed same-project source Gate."""
+
+    def setUp(self) -> None:
+        self.engine, self.db, self.clock = make_engine()
+        grant_capability(self.db, "user-anna", "requirement.coordinate", scope=SCOPE_A)
+        grant_capability(self.db, "user-anna", "design.coordinate", scope=SCOPE_A)
+
+    def _create_requirement_run(self) -> str:
+        source = self.engine.admit_work_order(
+            work_order_request(
+                start_intent_id="source-requirement-run",
+                graphId="requirement",
+                entrypoint="requirement.start",
+                graph=requirement_definition(),
+                inputSnapshot={"change_intake": "Implement requested feature"},
+            )
+        )
+        return str(source["runId"])
+
+    def _complete_source_gate(self, run_id: str) -> str:
+        output_digest = "sha256:" + "d" * 64
+        self.db.execute(
+            "UPDATE node_executions SET status = ?, output_digest = ? WHERE run_id = ?",
+            (NodeStatus.PASSED, output_digest, run_id),
+        )
+        self.db.execute(
+            "UPDATE graph_runs SET status = ?, state_version = state_version + 1 WHERE run_id = ?",
+            (GraphRunStatus.COMPLETED, run_id),
+        )
+        return output_digest
+
+    def _admit_design(self, run_id: str, **overrides):
+        request = work_order_request(
+            start_intent_id="design-from-requirement",
+            graphId="design",
+            entrypoint="design.start",
+            graph=design_definition(),
+            inputSnapshot={"requirement_baseline": {"artifact": "requirement-baseline"}},
+            requiredFactSources={"requirement_acceptance": {"sourceRunId": run_id}},
+        )
+        request.update(overrides)
+        return self.engine.admit_work_order(request)
+
+    def test_core_resolves_and_persists_verified_source_run_provenance(self) -> None:
+        source_run_id = self._create_requirement_run()
+        digest_value = self._complete_source_gate(source_run_id)
+
+        target = self._admit_design(source_run_id)
+        stored = self.db.query_one(
+            "SELECT required_facts_json FROM graph_runs WHERE run_id = ?", (target["runId"],)
+        )
+        fact = loads(stored["required_facts_json"], {})["requirement_acceptance"]
+        source = self.db.query_one("SELECT plan_hash, state_version FROM graph_runs WHERE run_id = ?", (source_run_id,))
+        self.assertEqual(fact["source"], f"graph-run:{source_run_id}#requirement_gate")
+        self.assertEqual(fact["sourceRevision"], f"{source['plan_hash']}@{source['state_version']}")
+        self.assertEqual(fact["contentHash"], digest_value)
+
+    def test_an_active_source_run_is_not_a_gate_receipt(self) -> None:
+        source_run_id = self._create_requirement_run()
+        with self.assertRaises(errors.PolyForgeError) as caught:
+            self._admit_design(source_run_id)
+        self.assertEqual(caught.exception.code, errors.ErrorCode.CONTRACT_INVALID)
+        self.assertIn("COMPLETED", caught.exception.message)
+        self.assertEqual(_count(self.db, "graph_runs"), 1)
+
+    def test_a_source_run_from_another_project_is_not_visible_as_a_receipt(self) -> None:
+        source_run_id = self._create_requirement_run()
+        self._complete_source_gate(source_run_id)
+        request = work_order_request(
+            start_intent_id="cross-project-design",
+            graphId="design",
+            entrypoint="design.start",
+            graph=design_definition(),
+            scope=SCOPE_B,
+            inputSnapshot={"requirement_baseline": "baseline"},
+            requiredFactSources={"requirement_acceptance": {"sourceRunId": source_run_id}},
+        )
+        grant_capability(self.db, "user-anna", "design.coordinate", scope=SCOPE_B)
+        with self.assertRaises(errors.PolyForgeError) as caught:
+            self.engine.admit_work_order(request)
+        self.assertEqual(caught.exception.code, errors.ErrorCode.CONTRACT_INVALID)
+        self.assertIn("same company and project", caught.exception.message)
+        self.assertEqual(_count(self.db, "graph_runs"), 1)
+
+    def test_required_fact_source_does_not_accept_caller_supplied_hashes(self) -> None:
+        source_run_id = self._create_requirement_run()
+        self._complete_source_gate(source_run_id)
+        with self.assertRaises(errors.PolyForgeError) as caught:
+            self._admit_design(
+                source_run_id,
+                requiredFacts={
+                    "requirement_acceptance": {
+                        "source": "forged",
+                        "sourceRevision": "r1",
+                        "contentHash": "sha256:" + "0" * 64,
+                    }
+                },
+            )
+        self.assertEqual(caught.exception.code, errors.ErrorCode.CONTRACT_INVALID)
 
 
 if __name__ == "__main__":

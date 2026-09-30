@@ -14,13 +14,20 @@ from __future__ import annotations
 
 import copy
 import json
+import tempfile
 import unittest
+from pathlib import Path
 from typing import Any, Mapping
 
 from polyforge.core import ids
 from polyforge.core.errors import ErrorCode
+from polyforge.core.registry.store import RegistryStore
+from polyforge.core.runtime.engine import RuntimeEngine
+from polyforge.core.store.db import Database
 from polyforge.graph_library import load_graph
+from polyforge.services.runtime_api import RuntimeService
 from services.polyforge.tests.runtime_api.fixtures import (
+    ISSUER,
     SCOPE_B,
     RuntimeApiCase,
     agent_actor,
@@ -225,7 +232,7 @@ class HttpFlowCase(RuntimeApiCase):
                 "rootIssueRef": {"provider": "paperclip", "kind": "issue", "id": "issue-e2e"},
                 "inputSnapshot": {"requirement_baseline": {"id": "rb-1"}},
                 "requiredFacts": {
-                    "requirement_gate_passed": {
+                    "requirement_acceptance": {
                         "source": "imp-1",
                         "sourceRevision": "rev-7",
                         "contentHash": "sha256:" + "ab" * 32,
@@ -443,6 +450,40 @@ class GraphLibraryTests(HttpFlowCase):
             body["graphs"],
             [],
             "another tenant's published graph must not appear in this scope",
+        )
+
+
+class RequiredFactSourceApiTests(HttpFlowCase):
+    """The signed work-order route sends fact-source selectors to Core verification."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.publish_design()
+
+    def test_a_nonexistent_source_run_is_rejected_before_run_creation(self) -> None:
+        status, body, _ = self.call(
+            "POST",
+            "/v1/work-orders",
+            {
+                "commandId": ids.new_id("command"),
+                "idempotencyKey": "admission:fact-source-api:design.start",
+                "correlationId": "fact-source-api",
+                "startIntentId": "fact-source-api",
+                "graphId": "design",
+                "entrypoint": "design.start",
+                "rootIssueRef": {"provider": "paperclip", "kind": "issue", "id": "issue-fact-source"},
+                "inputSnapshot": {"requirement_baseline": {"id": "baseline"}},
+                "requiredFactSources": {
+                    "requirement_acceptance": {"sourceRunId": "run-not-in-this-project"}
+                },
+                "policyRules": [allow_rule()],
+            },
+        )
+        self.assertEqual(status, 422, msg=body)
+        self.assertIn("same company and project", body["error"]["message"])
+        self.assertEqual(
+            self.engine.db.query_one("SELECT COUNT(*) AS n FROM graph_runs")["n"],
+            0,
         )
 
 class PassPathTests(HttpFlowCase):
@@ -806,6 +847,162 @@ class HumanDecisionPathTests(HttpFlowCase):
             merged,
         )
         self.assertError(status, body, ErrorCode.SCOPE_VIOLATION.value)
+
+
+class DurableRuntimeRestartTests(HttpFlowCase):
+    """The HTTP human-wait path survives a fresh Runtime service over the same SQLite file."""
+
+    def setUp(self) -> None:
+        self._temporary_directory = tempfile.TemporaryDirectory(prefix="polyforge-runtime-restart-")
+        self.addCleanup(self._temporary_directory.cleanup)
+        self.database_path = str(Path(self._temporary_directory.name) / "runtime.sqlite")
+        super().setUp()
+
+        self.publish_design()
+        self.admit("durable-restart-1")
+        self.work("architecture", ARCHITECT, ("architecture_spec", "api_contract"), "restart-arch")
+        self.work("security_review", SECURITY_REVIEWER, ("security_review", "threat_model"), "restart-sec")
+        gate = self.arm_design_gate()
+        status, transition, _ = self.call(
+            "POST",
+            f"/v1/runs/{self.run_id}/transitions",
+            {
+                "nodeId": "design_gate",
+                "attemptId": gate["attemptId"],
+                "leaseEpoch": gate["leaseEpoch"],
+                "commandId": ids.new_id("command"),
+                "idempotencyKey": f"{self.run_id}:restart:design-gate",
+                "payload": {"evidenceIds": [], "summary": "ready for a human decision"},
+            },
+        )
+        self.assertEqual(status, 202, msg=transition)
+        pending = self.snapshot()["pendingGovernance"][0]
+        self.request_id = pending["requestId"]
+        self.target_hash = pending["decisionTargetHash"]
+
+    def call(
+        self,
+        method: str,
+        path: str,
+        body: Any = None,
+        *,
+        actor: Mapping[str, Any] | None = None,
+        headers: Mapping[str, str] | None = None,
+        scope: Mapping[str, str] | None = None,
+    ) -> tuple[int, dict[str, Any], dict[str, str]]:
+        """Drive the setup flow over the socket too; do not let helpers bypass HTTP routing."""
+        payload = b"" if body is None else json.dumps(body).encode("utf-8")
+        request_headers = self.client.headers(method, path, payload, actor=actor, scope=scope)
+        if headers:
+            request_headers.update(headers)
+        return http_call(self.base_url, method, path, body, request_headers)
+
+    def _restart_runtime(self) -> None:
+        # Stop the loopback HTTP server first, then close every connection to the durable file.
+        self._server_stoppers[-1]()
+        self.service.stop()
+        self.db.close()
+
+        self.db = Database(self.database_path, clock=self.clock)
+        # Register immediately so even a failed migration/reconstruction releases the file lock.
+        self.addCleanup(self.db.close)
+        self.db.migrate()
+        self.registry = RegistryStore(self.db, clock=self.clock)
+        self.engine = RuntimeEngine(
+            self.db,
+            clock=self.clock,
+            registry=self.registry,
+            bridge_issuer=ISSUER,
+            bridge_expected_issuer=ISSUER,
+        )
+        self.service = RuntimeService(
+            self.config,
+            engine=self.engine,
+            registry=self.registry,
+            database=self.db,
+            clock=self.clock,
+        )
+        self.client = self.client.__class__(self.service)
+        # Cleanup order is server -> service loops -> database -> temporary directory.
+        self.addCleanup(self.service.stop)
+        self.base_url = self.start_server()
+
+    def _socket_call(
+        self, method: str, path: str, body: Any = None, *, actor: Mapping[str, Any] | None = None
+    ) -> tuple[int, dict[str, Any], dict[str, Any]]:
+        payload = b"" if body is None else json.dumps(body).encode("utf-8")
+        headers = self.client.headers(method, path, payload, actor=actor)
+        return http_call(self.base_url, method, path, body, headers)
+
+    def test_human_wait_and_resolution_survive_runtime_service_restart(self) -> None:
+        self.assertEqual(self.snapshot()["status"], "WAITING")
+        before_restart_version = self.snapshot()["stateVersion"]
+        self._restart_runtime()
+
+        status, snapshot, _ = self._socket_call("GET", f"/v1/runs/{self.run_id}")
+        self.assertEqual(status, 200, msg=snapshot)
+        self.assertEqual(snapshot["status"], "WAITING")
+        self.assertEqual(snapshot["stateVersion"], before_restart_version)
+        pending = snapshot["pendingGovernance"]
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(pending[0]["requestId"], self.request_id)
+        self.assertEqual(pending[0]["decisionTargetHash"], self.target_hash)
+
+        request = {
+            "commandId": ids.new_id("command"),
+            "idempotencyKey": "durable-restart:human-resolution:accept",
+            "responderSubject": REVIEWER,
+            "responderKind": "human",
+            "outcome": "accept",
+            "verifiedAgainstProvider": True,
+            "detail": {"decisionTargetHash": self.target_hash, "reason": "verified after restart"},
+        }
+        path = f"/v1/runs/{self.run_id}/governance/{self.request_id}/resolution"
+        status, resolution, _ = self._socket_call(
+            "POST", path, request, actor=REVIEWER_ACTOR
+        )
+        self.assertEqual(status, 200, msg=resolution)
+        self.assertEqual(resolution["status"], "PASSED")
+        completed = self._socket_call("GET", f"/v1/runs/{self.run_id}")[1]
+        self.assertEqual(completed["status"], "COMPLETED")
+        completed_version = completed["stateVersion"]
+
+        replay_status, replay, _ = self._socket_call(
+            "POST", path, request, actor=REVIEWER_ACTOR
+        )
+        self.assertEqual(replay_status, 200, msg=replay)
+        self.assertEqual(replay["status"], "PASSED")
+        after_replay = self._socket_call("GET", f"/v1/runs/{self.run_id}")[1]
+        self.assertEqual(after_replay["stateVersion"], completed_version)
+        self.assertEqual(after_replay["pendingGovernance"], [])
+
+
+class MissingEvidenceFlowTests(HttpFlowCase):
+    """The HTTP boundary cannot turn an empty evidence submission into a pass."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.publish_design()
+        self.admit("missing-evidence-1")
+
+    def test_a_transition_without_required_evidence_does_not_pass_or_release_dependents(self) -> None:
+        attempt = self.claim("architecture", ARCHITECT)
+        status, transition, _ = self.call(
+            "POST",
+            f"/v1/runs/{self.run_id}/transitions",
+            {
+                "nodeId": "architecture",
+                "attemptId": attempt["attemptId"],
+                "leaseEpoch": attempt["leaseEpoch"],
+                "commandId": ids.new_id("command"),
+                "idempotencyKey": f"{self.run_id}:missing-evidence:transition",
+                "payload": {"evidenceIds": [], "summary": "attempt without required evidence"},
+            },
+        )
+        self.assertEqual(status, 200, msg=transition)
+        self.assertFalse(transition["applied"], "missing evidence is not a passing transition")
+        self.assertNotEqual(self.node("architecture")["status"], "PASSED")
+        self.assertEqual(self.node("security_review")["status"], "PENDING")
 
 
 class MigrationCommitFlowTests(HttpFlowCase):

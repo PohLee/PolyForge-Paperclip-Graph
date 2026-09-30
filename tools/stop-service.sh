@@ -4,7 +4,7 @@
 set -euo pipefail
 source /mnt/d/Projects/00.Own/05.AI-Ops/PolyForge-Paperclip-Graph/tools/env.sh
 
-PIDFILE="$PF_DATA_DIR/runtime.pid"
+PIDFILE="${POLYFORGE_RUNTIME_PIDFILE:-$PF_DATA_DIR/runtime.pid}"
 if [[ ! -f "$PIDFILE" ]]; then
   echo "no pidfile at $PIDFILE; nothing to stop"
   exit 0

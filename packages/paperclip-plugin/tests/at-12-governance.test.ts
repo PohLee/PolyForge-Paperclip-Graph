@@ -34,10 +34,10 @@ const manifest = h.manifest;
 
 const { COMPANY_A, PROJECT_A, SHARED_SECRET, buildBridge, company, project, issue, answeredInteraction } = h;
 const bridges: { dispose(): void }[] = [];
-after(() => {
-  for (const bridge of bridges) bridge.dispose();
+after(async () => {
+  for (const bridge of bridges) await bridge.dispose();
 });
-function track<T extends { dispose(): void }>(bridge: T): T {
+function track<T extends { dispose(): Promise<void> }>(bridge: T): T {
   bridges.push(bridge);
   return bridge;
 }

@@ -36,10 +36,10 @@ const {
 } = h;
 
 const bridges: { dispose(): void }[] = [];
-after(() => {
-  for (const bridge of bridges) bridge.dispose();
+after(async () => {
+  for (const bridge of bridges) await bridge.dispose();
 });
-function track<T extends { dispose(): void }>(bridge: T): T {
+function track<T extends { dispose(): Promise<void> }>(bridge: T): T {
   bridges.push(bridge);
   return bridge;
 }
@@ -523,4 +523,3 @@ test("AT-03: the scope assertion is exact, not a prefix or case-insensitive matc
     /cross-project access refused/,
   );
 });
-

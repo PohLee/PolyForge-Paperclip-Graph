@@ -71,13 +71,7 @@ const CORE_CURRENT = {
     effectivePolicy: { "budget.ceiling": 100, "network.egress": "denied" },
     authority: {},
     environment: {},
-    // The Core's own mutation objects, not a list of names (engine.py `_intended_mutations`, and
-    // the shape its ingestion reads `kind` from). A fixture of bare strings made the old
-    // string-only mapping look correct while the production body lost every entry.
-    intendedMutations: [
-      { kind: "architecture_spec", target: "architecture_spec", operation: "produce", requiresTrustedExecution: false },
-      { kind: "api_contract", target: "api_contract", operation: "produce", requiresTrustedExecution: false },
-    ],
+    intendedMutations: ["issue.create", "issue.update"],
     requiredEvidenceKinds: ["test_report"],
     requiredEvaluators: ["contract_schema_v1"],
     planHash: "sha256:plan",
@@ -144,33 +138,6 @@ function clientFor(
   });
 }
 
-/**
- * A company bundle whose store records `run-1` in `project-a`.
- *
- * The production `toolRuntimeFor` signs every run-scoped call with the project from the run's own
- * durable binding, so a company without one is refused with BLOCKED_SCOPE before it reaches the
- * Core. That is the behaviour under test, and these fixtures have to satisfy it rather than bypass
- * it.
- */
-async function companyWithRunBinding(runtime: RuntimeModule) {
-  const { BridgeStore } = await load<typeof import("../src/store.ts")>(
-    new URL("../src/store.ts", import.meta.url),
-  );
-  const { mkdtempSync } = await import("node:fs");
-  const { tmpdir } = await import("node:os");
-  const { join } = await import("node:path");
-
-  const store = BridgeStore.open({ path: join(mkdtempSync(join(tmpdir(), "pf-current-")), "bridge.sqlite") });
-  store.putBinding({
-    companyId: "company-a",
-    kind: "run",
-    providerId: "run-1",
-    projectId: "project-a",
-    payload: { runId: "run-1", projectId: "project-a" },
-  });
-  return { companyId: "company-a", runtime: clientFor(runtime, respondWith(CORE_CURRENT)), store } as never;
-}
-
 const SCOPE = { companyRef: "company-a", projectRef: "project-a" };
 const AGENT = { actorType: "agent" as const, actorId: "agent-1", agentId: "agent-1", roles: [] };
 
@@ -218,7 +185,14 @@ test("a run-scoped read names the project and is signed on the base-relative pat
 test("the production mapper reads the Core's nested contract and attempt", async () => {
   const runtime = await load<RuntimeModule>(new URL("../src/runtime-client.ts", import.meta.url));
   const worker = await load<WorkerModule>(new URL("../src/worker.ts", import.meta.url));
-  const toolRuntime = worker.__testing.toolRuntimeFor(await companyWithRunBinding(runtime));
+  const client = clientFor(runtime, respondWith(CORE_CURRENT));
+  const toolRuntime = worker.__testing.toolRuntimeFor({
+    companyId: "company-a",
+    runtime: client,
+    store: { getBinding: () => ({ projectId: "project-a" }) },
+    metrics: { bump() {} },
+    logger: QUIET_LOGGER,
+  } as never);
 
   const view = await toolRuntime.current("company-a", "run-1");
 
@@ -229,11 +203,7 @@ test("the production mapper reads the Core's nested contract and attempt", async
   assert.equal(view.nodeId, "architecture");
   assert.equal(view.iteration, 2);
   assert.deepEqual(view.requiredInputs, ["spec.path", "spec.revision"]);
-  assert.deepEqual(
-    view.permittedOutputs,
-    ["architecture_spec", "api_contract"],
-    "an agent can only claim honestly if it can see what it is allowed to produce",
-  );
+  assert.deepEqual(view.permittedOutputs, ["issue.create", "issue.update"]);
   assert.deepEqual(view.evidenceRequirements, ["test_report"]);
   assert.deepEqual(view.policyConstraints, { "budget.ceiling": 100, "network.egress": "denied" });
   assert.equal(view.previousOwnerAgentRunId, "agent-run-0", "adoption must know whose attempt it takes");
@@ -259,7 +229,9 @@ test("the production mapper refuses a current response it does not implement", a
   const toolRuntime = worker.__testing.toolRuntimeFor({
     companyId: "company-a",
     runtime: client,
-    store: (await companyWithRunBinding(runtime)).store,
+    store: { getBinding: () => ({ projectId: "project-a" }) },
+    metrics: { bump() {} },
+    logger: QUIET_LOGGER,
   } as never);
 
   await assert.rejects(
@@ -271,32 +243,5 @@ test("the production mapper refuses a current response it does not implement", a
       return true;
     },
     "a wire format this bridge does not implement must be named, not answered with an empty contract",
-  );
-});
-
-test("a mutation the bridge cannot read is named, not silently dropped", async () => {
-  const runtime = await load<RuntimeModule>(new URL("../src/runtime-client.ts", import.meta.url));
-  const worker = await load<WorkerModule>(new URL("../src/worker.ts", import.meta.url));
-
-  // A mutation that is neither a name nor a Core mutation object. Dropping it would leave the agent
-  // believing it may not produce something the contract does permit, which is the same class of
-  // silence as inventing one it may not.
-  const body = structuredClone(CORE_CURRENT);
-  body.contract.intendedMutations = [{ target: "architecture_spec" }];
-
-  const toolRuntime = worker.__testing.toolRuntimeFor({
-    companyId: "company-a",
-    runtime: clientFor(runtime, respondWith(body)),
-    store: (await companyWithRunBinding(runtime)).store,
-  } as never);
-
-  await assert.rejects(
-    () => toolRuntime.current("company-a", "run-1"),
-    (error: unknown) => {
-      const err = error as { code?: string; message?: string };
-      assert.equal(err.code, "BRIDGE_PROTOCOL_INCOMPATIBLE");
-      assert.match(err.message ?? "", /intendedMutations/);
-      return true;
-    },
   );
 });

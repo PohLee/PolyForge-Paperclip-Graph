@@ -306,8 +306,9 @@ const manifest: PaperclipPluginManifestV1 = {
                 size: { type: "number" },
                 source: {
                   type: "object",
+                  description: "Use an issue-scoped document ref or inline bytes; attachment reads are not enabled.",
                   properties: {
-                    kind: { type: "string", enum: ["attachment", "document", "inline"] },
+                    kind: { type: "string", enum: ["document", "inline"] },
                     ref: { type: "string" },
                     body: { type: "string" },
                   },
@@ -409,6 +410,15 @@ const manifest: PaperclipPluginManifestV1 = {
   ],
 
   apiRoutes: [
+    {
+      routeKey: "agent-tool",
+      method: "POST",
+      path: "/issues/:issueId/tools/:toolName",
+      auth: "agent",
+      capability: "api.routes.register",
+      checkoutPolicy: "required-for-agent-in-progress",
+      companyResolution: { from: "issue", param: "issueId" },
+    },
     {
       routeKey: "runs",
       method: "GET",

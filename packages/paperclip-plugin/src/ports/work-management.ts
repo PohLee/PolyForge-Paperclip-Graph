@@ -43,6 +43,7 @@ import type { BridgeDeps } from "./index.js";
 import { guardScope, providerRef } from "./index.js";
 import { INTENT_KINDS, workUnitEffectKey } from "../outbox/intents.js";
 import { BridgeError, UnsupportedCapabilityError } from "../errors.js";
+import { isFullGitObjectId, readPinnedGitObjectId } from "../workspace-metadata.ts";
 
 /** The `originKind` the bridge owns. Child issues are distinguishable from human work. */
 export const CHILD_ISSUE_ORIGIN_KIND = "plugin:polyforge:node" as const;
@@ -99,6 +100,39 @@ export class WorkManagementPortImpl implements WorkManagementPort {
       );
     }
 
+    // Reject a repository work unit before looking up or creating any child Issue. Without an
+    // exact immutable commit, the later dispatch check can never succeed and materializing an
+    // Issue would make an unsupported intent look like accepted work.
+    const requestedRepositories = intent.workspaceRequirement.repositories;
+    if (requestedRepositories.length > 0 && intent.workspaceRequirement.mode !== "read_write") {
+      throw new UnsupportedCapabilityError(
+        "execution.workspaces.read",
+        `workspace mode ${intent.workspaceRequirement.mode} is not implemented for repository work; only an isolated writable workspace with a verified exact commit can be dispatched`,
+        { mode: intent.workspaceRequirement.mode },
+      );
+    }
+    if (requestedRepositories.length > 1) {
+      throw new UnsupportedCapabilityError(
+        "execution.workspaces.read",
+        "multi-repository work units are not implemented; this bridge can verify one repository per isolated workspace",
+        { repositoryCount: requestedRepositories.length },
+      );
+    }
+    if (requestedRepositories.length > 0 && intent.workspaceRequirement.requireReadOnlyForReviewer) {
+      throw new UnsupportedCapabilityError(
+        "execution.workspaces.read",
+        "the Paperclip issue API cannot guarantee a read-only reviewer view of a repository workspace",
+        { requireReadOnlyForReviewer: true },
+      );
+    }
+    if (requestedRepositories.length > 0 && !isFullGitObjectId(requestedRepositories[0]?.commit)) {
+      throw new UnsupportedCapabilityError(
+        "execution.workspaces.read",
+        "repository work requires exactly one repository in read_write mode with a full Git commit pin",
+        { repositoryCount: requestedRepositories.length, commitPinned: false },
+      );
+    }
+
     const effectKey = workUnitEffectKey(intent.scope, intent.runId, intent.nodeId, intent.iteration);
     const originId = childOriginId(intent.runId, intent.nodeId, intent.iteration);
     const bindingId = workUnitBindingId(intent.runId, intent.nodeId, intent.iteration);
@@ -124,11 +158,12 @@ export class WorkManagementPortImpl implements WorkManagementPort {
     const found = existingByOrigin[0];
     if (found) {
       this.#assertIssueInScope(found, intent, "ensureWorkUnit(existing)");
-      this.#recordBinding(intent, found.id, bindingId, originId, meta, null);
-      deliveries.observed(effectKey, { issueId: found.id, reused: true });
+      const existing = await this.#requestRepositoryIsolation(found, intent);
+      this.#recordBinding(intent, existing.id, bindingId, originId, meta, null);
+      deliveries.observed(effectKey, { issueId: existing.id, reused: true });
       deliveries.reconciled(effectKey, "existing work unit re-used");
-      logger2.info("re-used an existing child issue for a replayed work unit", { issueId: found.id });
-      return providerRef("issue", found.id);
+      logger2.info("re-used an existing child issue for a replayed work unit", { issueId: existing.id });
+      return providerRef("issue", existing.id);
     }
 
     // (3) local binding, in case a previous create succeeded but the record was lost.
@@ -136,6 +171,7 @@ export class WorkManagementPortImpl implements WorkManagementPort {
     if (binding) {
       const recorded = await ctx.issues.get(String(JSON.parse(binding.payloadJson)["issueId"] ?? ""), intent.scope.companyRef);
       if (recorded) {
+        await this.#requestRepositoryIsolation(recorded, intent);
         deliveries.reconciled(effectKey, "work unit recovered from the local binding");
         return providerRef("issue", recorded.id);
       }
@@ -144,6 +180,28 @@ export class WorkManagementPortImpl implements WorkManagementPort {
 
     // (4) create.
     const projectId = await this.#resolveProjectId(intent);
+    const repoBacked = intent.workspaceRequirement.repositories.length > 0;
+    if (repoBacked && intent.workspaceRequirement.mode !== "read_write") {
+      throw new UnsupportedCapabilityError(
+        "execution.workspaces.read",
+        `workspace mode ${intent.workspaceRequirement.mode} is not implemented for repository work; only an isolated writable workspace with a verified exact commit can be dispatched`,
+        { mode: intent.workspaceRequirement.mode },
+      );
+    }
+    if (intent.workspaceRequirement.repositories.length > 1) {
+      throw new UnsupportedCapabilityError(
+        "execution.workspaces.read",
+        "multi-repository work units are not implemented; this bridge can verify one repository per isolated workspace",
+        { repositoryCount: intent.workspaceRequirement.repositories.length },
+      );
+    }
+    if (repoBacked && intent.workspaceRequirement.requireReadOnlyForReviewer) {
+      throw new UnsupportedCapabilityError(
+        "execution.workspaces.read",
+        "the Paperclip issue API cannot guarantee a read-only reviewer view of a repository workspace",
+        { requireReadOnlyForReviewer: true },
+      );
+    }
     const createInput: Parameters<typeof ctx.issues.create>[0] = {
       companyId: intent.scope.companyRef,
       projectId,
@@ -158,13 +216,21 @@ export class WorkManagementPortImpl implements WorkManagementPort {
       // and a human assignee would make it look like human-owned work in the board.
       actor: { actorAgentId: null, actorUserId: null, actorRunId: null },
     };
-    if (config.workspaceProviderMode === "inherited" && intent.parentIssueRef) {
+    if (repoBacked) {
+      // Ask Paperclip to realize the node in an isolated workspace using the project's
+      // workspace policy. This is a preference, not proof: dispatch still refuses until the
+      // host exposes an active isolated workspace with matching repository/ref/full commit.
+      // Do not also request parent inheritance, which could pin the child to a shared checkout.
+      createInput.executionWorkspacePreference = "isolated_workspace";
+      createInput.executionWorkspaceSettings = { mode: "isolated_workspace" };
+    } else if (config.workspaceProviderMode === "inherited" && intent.parentIssueRef) {
       // Inheriting is the host's own workspace policy. The bridge never provisions one and
       // never claims a path it did not receive from the host.
       createInput.inheritExecutionWorkspaceFromIssueId = intent.parentIssueRef.id;
     }
 
     const created = await ctx.issues.create(createInput);
+    await this.#requestRepositoryIsolation(created, intent);
     this.#recordBinding(intent, created.id, bindingId, originId, meta, created.id);
     deliveries.observed(effectKey, { issueId: created.id, reused: false });
     deliveries.reconciled(effectKey, "work unit created");
@@ -265,6 +331,80 @@ export class WorkManagementPortImpl implements WorkManagementPort {
       }
     }
     return project.id;
+  }
+
+  /**
+   * Ensure a repo-backed child carries the host's isolated-workspace request on every create,
+   * replay, and recovery path. Never repoint a realized workspace or overwrite an explicit
+   * conflicting issue preference; the subsequent dispatch check remains authoritative.
+   */
+  async #requestRepositoryIsolation(issue: Issue, intent: WorkUnitIntent): Promise<Issue> {
+    const repositories = intent.workspaceRequirement.repositories;
+    if (repositories.length === 0) return issue;
+    if (repositories.length === 1 && !isFullGitObjectId(repositories[0]?.commit)) {
+      throw new UnsupportedCapabilityError(
+        "execution.workspaces.read",
+        "repository work requires a full Git commit pin; the bridge will not request an unpinned workspace",
+        { repositoryCount: repositories.length, commitPinned: false },
+      );
+    }
+    if (repositories.length !== 1 || intent.workspaceRequirement.mode !== "read_write") {
+      throw new UnsupportedCapabilityError(
+        "execution.workspaces.read",
+        "this bridge only supports one repository in an isolated writable workspace",
+        { repositoryCount: repositories.length, mode: intent.workspaceRequirement.mode },
+      );
+    }
+    if (intent.workspaceRequirement.requireReadOnlyForReviewer) {
+      throw new UnsupportedCapabilityError(
+        "execution.workspaces.read",
+        "the Paperclip issue API cannot guarantee a read-only reviewer view of a repository workspace",
+        { requireReadOnlyForReviewer: true },
+      );
+    }
+
+    // If a workspace already exists, do not change the execution contract underneath it.
+    // assignAndWake will verify that workspace against the pinned repository/ref/commit.
+    if (issue.executionWorkspaceId != null || issue.currentExecutionWorkspace != null) return issue;
+
+    const preference = issue.executionWorkspacePreference;
+    const settings = issue.executionWorkspaceSettings;
+    if (preference !== null && preference !== "isolated_workspace") {
+      throw new UnsupportedCapabilityError(
+        "execution.workspaces.read",
+        "an existing child issue has a conflicting workspace preference; the bridge will not override it",
+        { preference },
+      );
+    }
+    if (settings?.mode !== undefined && settings.mode !== "isolated_workspace") {
+      throw new UnsupportedCapabilityError(
+        "execution.workspaces.read",
+        "an existing child issue has conflicting workspace settings; the bridge will not override them",
+        { mode: settings.mode },
+      );
+    }
+    if (preference === "isolated_workspace" && settings?.mode === "isolated_workspace") return issue;
+
+    const updated = await this.#deps.ctx.issues.update(
+      issue.id,
+      {
+        executionWorkspacePreference: "isolated_workspace",
+        executionWorkspaceSettings: { ...(settings ?? {}), mode: "isolated_workspace" },
+      },
+      intent.scope.companyRef,
+      { actorAgentId: null, actorUserId: null, actorRunId: null },
+    );
+    if (
+      updated.executionWorkspacePreference !== "isolated_workspace" ||
+      updated.executionWorkspaceSettings?.mode !== "isolated_workspace"
+    ) {
+      throw new UnsupportedCapabilityError(
+        "execution.workspaces.read",
+        "Paperclip did not persist the requested isolated workspace preference",
+        { issueId: issue.id },
+      );
+    }
+    return updated;
   }
 
   #recordBinding(
@@ -490,7 +630,143 @@ export class WorkManagementPortImpl implements WorkManagementPort {
       };
     }
 
-    const agentId = await this.#resolveAgentId(binding.workerSubjectRef, binding.scope.companyRef);
+    const agentId = await this.#resolveAgentId(binding.workerSubjectRef, binding.scope.companyRef, binding.scope.projectRef);
+
+    // A repo-backed READY node must not wake an agent on the project's shared primary
+    // workspace. The bridge currently has read-only workspace APIs, so only a host-provided,
+    // active isolated execution workspace attached to this exact issue, with host metadata
+    // matching the single pinned repo/ref/commit, is an acceptable execution target.
+    // Missing/legacy workspace requirements are unknown, not permission.
+    const workUnitPayload = workUnit ? safeJson(workUnit.payloadJson) : {};
+    const requirement = workUnitPayload["workspaceRequirement"];
+    const repositories = requirement && typeof requirement === "object" && !Array.isArray(requirement)
+      ? (requirement as Record<string, unknown>)["repositories"]
+      : undefined;
+    const requiredCapabilities = Array.isArray(workUnitPayload["requiredCapabilities"])
+      ? workUnitPayload["requiredCapabilities"].filter((value): value is string => typeof value === "string")
+      : [];
+    if (!Array.isArray(repositories)) {
+      metrics.bump(binding.scope.companyRef, "workspaceValidationFailures");
+      const reason = "workspace_requirement_unavailable";
+      deliveries.observed(effectKey, { queued: false }, { error: reason });
+      return {
+        workUnitRef: providerRef("issue", issueId),
+        workUnitKey: workUnitId,
+        agentRunRef: null,
+        queued: false,
+        reason,
+      };
+    }
+    if (requiredCapabilities.includes("code.modify") && repositories.length === 0) {
+      metrics.bump(binding.scope.companyRef, "workspaceValidationFailures");
+      const reason = "repo_workspace_requirement_missing_for_code_modify";
+      deliveries.observed(effectKey, { queued: false }, { error: reason });
+      logger2.warn("code.modify work unit was not dispatched without an explicit repository requirement", {
+        issueId,
+        reason,
+      });
+      return {
+        workUnitRef: providerRef("issue", issueId),
+        workUnitKey: workUnitId,
+        agentRunRef: null,
+        queued: false,
+        reason,
+      };
+    }
+    const workspaceRequirement = requirement as Record<string, unknown>;
+    if (repositories.length > 0 && workspaceRequirement["requireReadOnlyForReviewer"] === true) {
+      metrics.bump(binding.scope.companyRef, "workspaceValidationFailures");
+      const reason = "read_only_reviewer_workspace_not_supported";
+      deliveries.observed(effectKey, { queued: false }, { error: reason });
+      logger2.warn("repo-backed reviewer work is not enforceable by this bridge", { issueId, reason });
+      return {
+        workUnitRef: providerRef("issue", issueId),
+        workUnitKey: workUnitId,
+        agentRunRef: null,
+        queued: false,
+        reason,
+      };
+    }
+    if (repositories.length > 0 && workspaceRequirement["mode"] !== "read_write") {
+      metrics.bump(binding.scope.companyRef, "workspaceValidationFailures");
+      const reason = "repo_workspace_mode_not_supported";
+      deliveries.observed(effectKey, { queued: false }, { error: reason });
+      logger2.warn("repo-backed work unit mode is not enforceable by this bridge", { issueId, reason });
+      return {
+        workUnitRef: providerRef("issue", issueId),
+        workUnitKey: workUnitId,
+        agentRunRef: null,
+        queued: false,
+        reason,
+      };
+    }
+    if (repositories.length > 0) {
+      const workspace = issue.currentExecutionWorkspace;
+      if (!workspace) {
+        metrics.bump(binding.scope.companyRef, "workspaceValidationFailures");
+        const reason = "execution_workspace_not_realized";
+        deliveries.observed(effectKey, { queued: false }, { error: reason });
+        logger2.warn("Paperclip has not realized the requested execution workspace; the agent was not woken", {
+          issueId,
+          reason,
+        });
+        return {
+          workUnitRef: providerRef("issue", issueId),
+          workUnitKey: workUnitId,
+          agentRunRef: null,
+          queued: false,
+          reason,
+        };
+      }
+      const repository = repositories.length === 1 && repositories[0] && typeof repositories[0] === "object"
+        ? repositories[0] as Record<string, unknown>
+        : null;
+      let executionMetadata = null;
+      try {
+        executionMetadata = await ctx.executionWorkspaces.get(workspace.id, binding.scope.companyRef);
+      } catch {
+        // An unsupported/unavailable metadata surface is a block, not a reason to trust the
+        // issue's display projection alone.
+      }
+      const providerMetadata = executionMetadata?.providerMetadata ?? {};
+      const actualRepoRef = providerMetadata["repoRef"] ?? providerMetadata["repoUrl"] ?? executionMetadata?.repoUrl;
+      const actualCommit = readPinnedGitObjectId(providerMetadata);
+      const validWorkspace = repository !== null &&
+        typeof repository["repoRef"] === "string" &&
+        typeof repository["baseRef"] === "string" &&
+        isFullGitObjectId(repository["commit"]) &&
+        workspace !== null && workspace !== undefined &&
+        workspace.companyId === binding.scope.companyRef &&
+        workspace.projectId === binding.scope.projectRef &&
+        workspace.status === "active" &&
+        workspace.mode === "isolated_workspace" &&
+        (workspace.providerType === "git_worktree" || workspace.providerType === "cloud_sandbox") &&
+        typeof workspace.cwd === "string" && workspace.cwd.length > 0 &&
+        executionMetadata !== null &&
+        executionMetadata.id === workspace.id &&
+        executionMetadata.companyId === binding.scope.companyRef &&
+        executionMetadata.projectId === binding.scope.projectRef &&
+        (actualRepoRef === repository["repoRef"] || executionMetadata.repoUrl === repository["repoRef"]) &&
+        executionMetadata.baseRef === repository["baseRef"] &&
+        actualCommit === repository["commit"].toLowerCase();
+      if (!validWorkspace) {
+        metrics.bump(binding.scope.companyRef, "workspaceValidationFailures");
+        const reason = "verified_isolated_execution_workspace_and_commit_required";
+        deliveries.observed(effectKey, { queued: false }, { error: reason });
+        logger2.warn("repo-backed work unit was not dispatched without an active isolated execution workspace", {
+          issueId,
+          reason,
+        });
+        return {
+          workUnitRef: providerRef("issue", issueId),
+          workUnitKey: workUnitId,
+          agentRunRef: null,
+          queued: false,
+          reason,
+        };
+      }
+    }
+
     await ctx.issues.update(issueId, { assigneeAgentId: agentId }, binding.scope.companyRef, {
       actorAgentId: null,
       actorUserId: null,
@@ -563,10 +839,10 @@ export class WorkManagementPortImpl implements WorkManagementPort {
     };
   }
 
-  async #resolveAgentId(subjectRef: string, companyId: string): Promise<string> {
+  async #resolveAgentId(subjectRef: string, companyId: string, projectId: string): Promise<string> {
     // The subject ref is the key a capability grant is filed under, so that is what is looked up
     // first; an agent id is accepted as a fallback so an operator can bind without a prefix.
-    const binding = this.#deps.capabilities.bindingForSubject(companyId, subjectRef);
+    const binding = this.#deps.capabilities.bindingForSubject(companyId, projectId, subjectRef);
     if (binding) return binding.agentId;
     const agent = await this.#deps.ctx.agents.get(subjectRef, companyId);
     if (agent) return agent.id;
@@ -580,9 +856,9 @@ export class WorkManagementPortImpl implements WorkManagementPort {
   // -------------------------------------------------------------------------
 
   /**
-   * Ask the platform to stop an execution, reporting only what can be confirmed.
+   * Check whether an execution can be confirmed stopped; this does not terminate a live run.
    *
-   * On this baseline the SDK exposes no plugin-callable execution stop. The three outcomes we
+   * On this baseline the SDK exposes no plugin-callable execution stop. The observations we
    * *can* establish without one:
    * * the issue is gone → `not_found`
    * * the issue is terminal, so nothing is running → `already_terminal`
@@ -620,19 +896,22 @@ export class WorkManagementPortImpl implements WorkManagementPort {
         deliveries.observed(effectKey, { outcome: "not_found" });
         return { requested: false, outcome: "not_found", observedAt };
       }
-      if (issue.status === "done" || issue.status === "cancelled") {
+      const activeRun = issue.activeRun;
+      if (activeRun !== null && activeRun !== undefined) {
+        // The Issue's board status is not proof that its heartbeat stopped: a human can mark
+        // an Issue done/cancelled while the host still reports an active run. Trust the run
+        // record first, and only treat its explicit terminal state as a stop confirmation.
+        if (isFinishedRunStatus(activeRun.status)) {
+          deliveries.observed(effectKey, { outcome: "already_terminal" });
+          return { requested: false, outcome: "already_terminal", observedAt };
+        }
+      } else if (issue.status === "done" || issue.status === "cancelled") {
         deliveries.observed(effectKey, { outcome: "already_terminal" });
         return { requested: false, outcome: "already_terminal", observedAt };
-      }
-      const activeRun = issue.activeRun;
-      if (activeRun === null || activeRun === undefined) {
-        // No live run. That is confirmable: there is nothing executing.
+      } else {
+        // No platform run and a non-terminal Issue. That is confirmable: nothing is executing.
         deliveries.observed(effectKey, { outcome: "confirmed_stopped" });
         return { requested: false, outcome: "confirmed_stopped", observedAt };
-      }
-      if (isFinishedRunStatus(activeRun.status)) {
-        deliveries.observed(effectKey, { outcome: "already_terminal" });
-        return { requested: false, outcome: "already_terminal", observedAt };
       }
       // A run is live and the plugin has no stop API. Report `unknown` and count the
       // platform gap so it is visible in health rather than inferred from silence.
@@ -819,7 +1098,7 @@ export class WorkManagementPortImpl implements WorkManagementPort {
 }
 
 function isFinishedRunStatus(status: string): boolean {
-  return ["finished", "completed", "failed", "cancelled", "aborted", "error"].includes(status);
+  return ["finished", "completed", "succeeded", "failed", "cancelled", "aborted", "error"].includes(status);
 }
 
 function mapRunStatus(status: string): ExecutionObservation["state"] {

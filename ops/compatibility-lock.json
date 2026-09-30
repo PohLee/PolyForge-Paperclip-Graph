@@ -1,5 +1,5 @@
 {
-  "$comment": "Phase 0 compatibility lock (docs/03-MIGRATION-ROLLOUT-ACCEPTANCE.md P0-3). Every value here is read from the machine that actually runs the pilot, not from a registry ref. `latest`/`master` is not a production value. Regenerate with `node ops/probe-host.mjs --write` and review the diff before shipping.",
+  "$comment": "Phase 0 compatibility lock (docs/03-MIGRATION-ROLLOUT-ACCEPTANCE.md P0-3). Every value here is read from the machine that actually runs the pilot, not from a registry ref. `latest`/`master` is not a production value. Refresh the read-only host capability artifact with `node ops/probe-host.mjs --json ops/host-capability-report.json`; reconcile reviewed version and digest changes here before shipping. The unauthenticated-write probe is an explicit, potentially mutating opt-in and is not run by default.",
   "capturedAt": "2026-09-26",
   "capturedBy": "ops/probe-host.mjs",
 
@@ -32,9 +32,19 @@
     "package": "@paperclipai/hermes-paperclip-adapter",
     "version": "2026.916.1",
     "mode": "not_selected",
-    "notes": "Installed and present, but no mode was selected for the pilot. Paperclip remains the only runtime invoker regardless of which mode is chosen; the Core never spawns a worker."
+    "configurationReferenceSha256": {
+      "hermes_local": "0deec1911528998bbc9045954b11dbf115be1ab8f58898a9e37aab0e2de888b1",
+      "hermes_gateway": "8d7805d643a11b6d55928fa040d435d31688ef800e7d2d94a01ae441d3442bc3"
+    },
+    "configurationReferenceSha256Scope": "SHA-256 of exact response bytes from GET /llms/agent-configuration/{hermes_local|hermes_gateway}.txt on the 2026-09-30 read-only host probe; these are documentation references, not adapter package artifacts.",
+    "notes": "This version was observed in the host package inventory, and the read-only probe verifies both public config references are available. The live agent configuration and adapter executable artifact are not exposed by that probe. No mode is selected or certified for the pilot. Paperclip remains the only runtime invoker regardless of which mode is chosen; the Core never spawns a worker."
   },
   "hermesRuntime": { "version": "unverified", "capabilitiesDigest": null },
+
+  "codexLocalAdapter": {
+    "configurationReferenceSha256": "9f02037cbc53831429d1704117a880d741e089b1c86676760a7427f66f829fc8",
+    "configurationReferenceSha256Scope": "SHA-256 of exact response bytes from GET /llms/agent-configuration/codex_local.txt on the 2026-09-30 read-only host probe; this pins the configuration reference, not the adapter executable or a running session."
+  },
 
   "polyforge": {
     "protocolVersion": 1,

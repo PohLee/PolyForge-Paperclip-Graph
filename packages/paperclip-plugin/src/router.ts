@@ -29,7 +29,7 @@
  */
 
 import { stableIdempotencyKey } from "@polyforge/protocol";
-import type { ActorAssertion, CommandMeta, Scope } from "@polyforge/protocol";
+import type { ActorAssertion, CommandMeta, Scope, WorkOrderPolicyRule, WorkspaceRequirement } from "@polyforge/protocol";
 import type { Issue } from "@paperclipai/plugin-sdk";
 import type { BridgeDeps } from "./ports/index.js";
 import type { AdmissionDecision } from "./admission.js";
@@ -127,6 +127,77 @@ export class Router {
     );
   }
 
+  /**
+   * Pin node execution allows only for subjects with an explicit project-scoped capability
+   * binding. The Core pins these rules with the active plan; later binding changes cannot
+   * widen this run, and the run's separate human gate remains governed by its graph policy.
+   */
+  async executionPolicyRules(
+    scope: Scope,
+    graphId: string,
+  ): Promise<{ rules: WorkOrderPolicyRule[]; requiresRepositoryPin: boolean }> {
+    const { runtime, logger } = this.#deps;
+    if (runtime === null) {
+      throw new BridgeError("BRIDGE_CONFIG_INVALID", "BLOCKED_PLATFORM", "no runtime is configured to resolve active graph policies", { graphId });
+    }
+    const actor: ActorAssertion = {
+      actorType: "system",
+      actorId: "paperclip:admission",
+      agentId: null,
+      runId: null,
+      roles: [],
+    };
+    const response = await runtime.listGraphs(actor, scope);
+    const graph = response.graphs.find((entry) => entry["graphId"] === graphId);
+    const nodes = graph?.["nodePolicies"];
+    if (!Array.isArray(nodes)) {
+      throw new BridgeError(
+        "BRIDGE_PROTOCOL_INCOMPATIBLE",
+        "BLOCKED_PLATFORM",
+        "the Runtime graph catalogue does not expose active node capability requirements; execution policy cannot be pinned safely",
+        { graphId },
+      );
+    }
+
+    const rules: WorkOrderPolicyRule[] = [];
+    let requiresRepositoryPin = false;
+    for (const raw of nodes) {
+      if (typeof raw !== "object" || raw === null) continue;
+      const node = raw as Record<string, unknown>;
+      const nodeId = typeof node["nodeId"] === "string" ? node["nodeId"] : "";
+      const required = Array.isArray(node["requiredCapabilities"])
+        ? node["requiredCapabilities"].filter((value): value is string => typeof value === "string" && value.length > 0)
+        : [];
+      if (required.includes("code.modify")) requiresRepositoryPin = true;
+      if (nodeId.length === 0 || required.length === 0) continue;
+      const eligibleSubjects = Array.isArray(node["eligibleSubjects"])
+        ? node["eligibleSubjects"].filter((value): value is string => typeof value === "string" && value.length > 0)
+        : [];
+      for (const subjectRef of eligibleSubjects) {
+        rules.push({
+          ruleId: `paperclip-capability:${graphId}:${nodeId}:${subjectRef}`,
+          effect: "allow",
+          agentRef: subjectRef,
+          projectRef: scope.projectRef,
+          workflowRef: graphId,
+          transitionRef: `${graphId}.${nodeId}`,
+          actions: [`node.${nodeId}.execute`],
+          resources: [nodeId],
+          environments: ["production"],
+          requiredCapabilities: required,
+          version: "1",
+          reason: `the project-scoped Paperclip capability binding grants ${required.join(", ")} to this subject`,
+        });
+      }
+    }
+    logger.info("pinned node execution policies from project capability bindings", {
+      graphId,
+      projectId: scope.projectRef,
+      policyCount: rules.length,
+    });
+    return { rules, requiresRepositoryPin };
+  }
+
   constructor(deps: BridgeDeps) {
     this.#deps = deps;
   }
@@ -183,6 +254,24 @@ export class Router {
     // The entrypoint is resolved before anything durable is written, so a graph whose
     // entrypoints cannot be decided produces no intent to clean up.
     const entrypoint = await this.resolveEntrypoint(decision.scope, decision.graphId, decision.entrypoint);
+    const executionPolicy = await this.executionPolicyRules(decision.scope, decision.graphId);
+    if (executionPolicy.requiresRepositoryPin && decision.workspaceRequirement === null) {
+      throw new UnsupportedCapabilityError(
+        "project.workspaces.read",
+        "this graph contains code.modify nodes; add a one-repository full-commit workspaceRequirement to the human-authored work-order intent",
+        { graphId: decision.graphId, projectId: decision.projectId },
+      );
+    }
+    if (decision.workspaceRequirement !== null) {
+      if (!executionPolicy.requiresRepositoryPin) {
+        throw new UnsupportedCapabilityError(
+          "project.workspaces.read",
+          "a repository pin was supplied for a graph with no code.modify node; the bridge will not silently ignore it",
+          { graphId: decision.graphId },
+        );
+      }
+      await this.#assertRepositoryPinMatchesProjectWorkspace(decision.scope, decision.workspaceRequirement);
+    }
     const effectKey = workOrderEffectKey(decision.scope, decision.startIntentId, entrypoint);
     const payload = {
       scope: decision.scope,
@@ -191,6 +280,27 @@ export class Router {
       entrypoint,
       rootIssueRef: { provider: "paperclip", kind: "issue", id: decision.rootIssueId },
       inputSnapshot: decision.inputSnapshot,
+      ...(decision.workspaceRequirement === null ? {} : { workspaceRequirement: decision.workspaceRequirement }),
+      ...(Object.keys(decision.requiredFactSources).length === 0
+        ? {}
+        : { requiredFactSources: decision.requiredFactSources }),
+      // The start-run route is board-only and startRun independently rejects non-human actors.
+      // Admission is human-authorized, while execution policies are derived from the active
+      // graph and project-scoped capability bindings. These rules are pinned into this run.
+      policyRules: [
+        {
+          ruleId: `paperclip-admission:${decision.startIntentId}`,
+          effect: "allow",
+          projectRef: decision.projectId,
+          workflowRef: decision.graphId,
+          transitionRef: `${decision.graphId}.${entrypoint}`,
+          actions: ["work_order.admit"],
+          resources: [decision.rootIssueId],
+          environments: ["production"],
+          reason: "a board user explicitly admitted this Paperclip issue into the named graph entrypoint",
+        },
+        ...executionPolicy.rules,
+      ],
       // The actor the host authenticated, forwarded so the Core knows *who* admitted the run.
       // The bridge derived it from a host context and a tool parameter cannot reach it, so this
       // is the same assertion the bridge would have signed, not a new claim. It is carried in
@@ -238,6 +348,41 @@ export class Router {
       trigger: decision.trigger,
       scope: decision.scope,
     };
+  }
+
+  async #assertRepositoryPinMatchesProjectWorkspace(
+    scope: Scope,
+    requirement: WorkspaceRequirement,
+  ): Promise<void> {
+    const repository = requirement.repositories[0];
+    if (
+      requirement.mode !== "read_write" || requirement.requireReadOnlyForReviewer ||
+      requirement.repositories.length !== 1 || !repository
+    ) {
+      throw new UnsupportedCapabilityError(
+        "project.workspaces.read",
+        "the Phase 0–4 code path supports one writable repository pin per work order",
+        { repositoryCount: requirement.repositories.length, mode: requirement.mode },
+      );
+    }
+    const workspaces = await this.#deps.ctx.projects.listWorkspaces(scope.projectRef, scope.companyRef);
+    const matches = workspaces.filter((workspace) => workspace.repoUrl === repository.repoRef || workspace.repoRef === repository.repoRef);
+    if (matches.length !== 1) {
+      throw new UnsupportedCapabilityError(
+        "project.workspaces.read",
+        "the pinned repoRef must exactly match one Paperclip Project Workspace in the trusted Issue project",
+        { projectId: scope.projectRef, matchCount: matches.length },
+      );
+    }
+    const workspace = matches[0]!;
+    const expectedBaseRef = workspace.defaultRef ?? workspace.repoRef;
+    if (!expectedBaseRef || expectedBaseRef !== repository.baseRef) {
+      throw new UnsupportedCapabilityError(
+        "project.workspaces.read",
+        "the pinned baseRef does not match the selected Paperclip Project Workspace ref",
+        { projectId: scope.projectRef, workspaceId: workspace.id },
+      );
+    }
   }
 
   /**

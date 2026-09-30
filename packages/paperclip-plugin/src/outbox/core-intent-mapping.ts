@@ -17,6 +17,7 @@
  */
 
 import type { ProviderRefLike, Scope, WorkspaceMode, WorkspaceRequirement, WorkUnitIntent } from "@polyforge/protocol";
+import { isFullGitObjectId } from "../workspace-metadata.ts";
 
 /** The modes the port contract declares. Anything else is a Core this bridge does not implement. */
 const WORKSPACE_MODES: WorkspaceMode[] = ["read_write", "read_only_snapshot", "reuse_serially"];
@@ -100,10 +101,26 @@ function readScope(payload: Record<string, unknown>): Scope {
  */
 function readWorkspaceRequirement(payload: Record<string, unknown>): WorkspaceRequirement {
   const raw = payload["workspaceRequirement"];
-  const requirement = typeof raw === "object" && raw !== null ? (raw as Record<string, unknown>) : {};
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+    refuse("the Core's work-unit intent has no readable workspaceRequirement object", {
+      field: "workspaceRequirement",
+    });
+  }
+  const requirement = raw as Record<string, unknown>;
+  const knownRequirementKeys = new Set(["mode", "repositories", "requireReadOnlyForReviewer"]);
+  const unknownRequirementKeys = Object.keys(requirement).filter((key) => !knownRequirementKeys.has(key));
+  if (unknownRequirementKeys.length > 0) {
+    refuse("the Core's workspace requirement contains fields this bridge does not implement", {
+      field: "workspaceRequirement",
+      unknownKeys: unknownRequirementKeys,
+    });
+  }
   const mode = requirement["mode"];
   if (mode === undefined) {
-    return { mode: "read_write", repositories: [], requireReadOnlyForReviewer: false };
+    if (Object.keys(requirement).length === 0) {
+      return { mode: "read_write", repositories: [], requireReadOnlyForReviewer: false };
+    }
+    refuse("the Core's non-empty workspace requirement has no mode", { field: "workspaceRequirement.mode" });
   }
   if (typeof mode !== "string" || !WORKSPACE_MODES.includes(mode as WorkspaceMode)) {
     refuse(
@@ -112,26 +129,65 @@ function readWorkspaceRequirement(payload: Record<string, unknown>): WorkspaceRe
       { field: "workspaceRequirement.mode", known: [...WORKSPACE_MODES] },
     );
   }
-  const repositories = Array.isArray(requirement["repositories"]) ? requirement["repositories"] : [];
+  const rawRepositories = requirement["repositories"];
+  const repositories = rawRepositories === undefined
+    ? []
+    : Array.isArray(rawRepositories)
+      ? rawRepositories
+      : refuse("the Core's workspace repositories field is not an array", {
+          field: "workspaceRequirement.repositories",
+        });
+  const rawReadOnlyForReviewer = requirement["requireReadOnlyForReviewer"];
+  if (rawReadOnlyForReviewer !== undefined && typeof rawReadOnlyForReviewer !== "boolean") {
+    refuse("the Core's reviewer workspace policy is not a boolean", {
+      field: "workspaceRequirement.requireReadOnlyForReviewer",
+    });
+  }
+  const seenRepoRefs = new Set<string>();
   return {
     mode: mode as WorkspaceMode,
     repositories: repositories.map((entry) => {
-      const repo = (typeof entry === "object" && entry !== null ? entry : {}) as Record<string, unknown>;
+      if (typeof entry !== "object" || entry === null || Array.isArray(entry)) {
+        refuse("the Core's workspace requirement contains a malformed repository entry", {
+          field: "workspaceRequirement.repositories",
+        });
+      }
+      const repo = entry as Record<string, unknown>;
+      const unknownRepositoryKeys = Object.keys(repo).filter((key) => !["repoRef", "baseRef", "commit"].includes(key));
+      if (unknownRepositoryKeys.length > 0) {
+        refuse("the Core's repository requirement contains fields this bridge does not implement", {
+          field: "workspaceRequirement.repositories",
+          unknownKeys: unknownRepositoryKeys,
+        });
+      }
       const repoRef = repo["repoRef"];
       const baseRef = repo["baseRef"];
-      if (typeof repoRef !== "string" || repoRef.length === 0 || typeof baseRef !== "string") {
+      if (
+        typeof repoRef !== "string" || repoRef.trim().length === 0 ||
+        typeof baseRef !== "string" || baseRef.trim().length === 0
+      ) {
         refuse("the Core's workspace requirement names a repository this bridge cannot read", {
           field: "workspaceRequirement.repositories",
-          entry,
+        });
+      }
+      if (seenRepoRefs.has(repoRef)) {
+        refuse("the Core's workspace requirement lists the same repository more than once", {
+          field: "workspaceRequirement.repositories",
+        });
+      }
+      seenRepoRefs.add(repoRef);
+      if (!isFullGitObjectId(repo["commit"])) {
+        refuse("the Core's repository requirement has no full Git object ID commit pin", {
+          field: "workspaceRequirement.repositories.commit",
         });
       }
       return {
         repoRef,
         baseRef,
-        ...(typeof repo["commit"] === "string" ? { commit: repo["commit"] } : {}),
+        commit: repo["commit"].toLowerCase(),
       };
     }),
-    requireReadOnlyForReviewer: requirement["requireReadOnlyForReviewer"] === true,
+    requireReadOnlyForReviewer: rawReadOnlyForReviewer === true,
   };
 }
 

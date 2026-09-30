@@ -20,6 +20,19 @@ STAGE="${POLYFORGE_PLUGIN_STAGE:-$PF_DATA_DIR/plugin}"
 REPO="${POLYFORGE_REPO_WSL:-/mnt/d/Projects/00.Own/05.AI-Ops/PolyForge-Paperclip-Graph}"
 export PATH="/home/pohlee/.hermes/node/bin:$PATH"
 
+# Staging replaces one directory. Resolve both paths before any mkdir/move so a typo or symlink
+# cannot turn a stage operation into moving a home directory or an unrelated tree.
+PF_ROOT="$(realpath -m "$PF_DATA_DIR")"
+STAGE="$(realpath -m "$STAGE")"
+case "$STAGE" in
+  "$PF_ROOT"/*) ;;
+  *) echo "plugin stage must be a child of PF_DATA_DIR ($PF_ROOT): $STAGE" >&2; exit 1 ;;
+esac
+[[ "$PF_ROOT" != "/" && "$STAGE" != "$PF_ROOT" ]] || {
+  echo "refusing unsafe plugin stage target: $STAGE" >&2
+  exit 1
+}
+
 # The repository lives on a Windows drive reached through the WSL 9p automount, which
 # intermittently fails reads while still reporting the file as present. Verify a real read before
 # building, and again before copying, so a flaky mount cannot produce a half-staged build.
@@ -49,11 +62,12 @@ for required in dist/worker.js dist/manifest.js dist/ui/index.js; do
   head -c 1 "$SRC/$required" >/dev/null 2>&1 || { echo "missing build output: $SRC/$required" >&2; exit 1; }
 done
 
-mkdir -p "$STAGE"
-chmod 755 "$STAGE"
-
-NEXT="$STAGE.next"
-rm -rf "$NEXT"
+mkdir -p "$(dirname "$STAGE")"
+NEXT="$(mktemp -d "${STAGE}.next.XXXXXX")"
+cleanup() {
+  [[ -n "${NEXT:-}" && -d "$NEXT" ]] && rm -rf -- "$NEXT"
+}
+trap cleanup EXIT
 mkdir -p "$NEXT"
 cp -R "$SRC/dist" "$NEXT/dist"
 cp "$SRC/package.json" "$NEXT/package.json"
@@ -74,8 +88,21 @@ node -e '
   }, null, 2) + "\n");
 ' "$NEXT"
 
-rm -rf "$STAGE.previous"
-[[ -d "$STAGE" ]] && mv "$STAGE" "$STAGE.previous"
-mv "$NEXT" "$STAGE"
+BACKUP=""
+if [[ -e "$STAGE" ]]; then
+  BACKUP="$(mktemp -d "${STAGE}.previous.XXXXXX")"
+  rmdir "$BACKUP"
+  mv "$STAGE" "$BACKUP"
+fi
+if ! mv "$NEXT" "$STAGE"; then
+  if [[ -n "$BACKUP" && -d "$BACKUP" && ! -e "$STAGE" ]]; then
+    mv "$BACKUP" "$STAGE"
+  fi
+  echo "could not activate the staged build; previous stage restored" >&2
+  exit 1
+fi
+NEXT=""
+trap - EXIT
 
+[[ -z "$BACKUP" ]] || echo "previous stage retained at $BACKUP" >&2
 echo "$STAGE"

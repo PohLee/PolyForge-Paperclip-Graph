@@ -34,6 +34,7 @@ import type { PluginExecutionWorkspaceMetadata, PluginWorkspace } from "@papercl
 import type { BridgeDeps } from "./index.js";
 import { providerRef } from "./index.js";
 import { BridgeError, UnsupportedCapabilityError } from "../errors.js";
+import { readPinnedGitObjectId } from "../workspace-metadata.ts";
 
 export const WORKSPACE_BINDING_KIND = "workspace" as const;
 
@@ -69,15 +70,6 @@ function validatePathShape(path: string | null, problems: string[]): string | nu
     return null;
   }
   return path;
-}
-
-function readCommitFromMetadata(metadata: Record<string, unknown> | null): string | null {
-  if (!metadata) return null;
-  for (const key of ["commit", "headCommit", "resolvedCommit", "pinnedCommit"]) {
-    const value = metadata[key];
-    if (typeof value === "string" && /^[0-9a-f]{7,64}$/i.test(value)) return value;
-  }
-  return null;
 }
 
 function readRepoRef(metadata: Record<string, unknown> | null): string | null {
@@ -312,7 +304,7 @@ export class WorkspacePortImpl implements WorkspacePort {
     companyId: string,
   ): WorkspaceObservation {
     const path = validatePathShape(metadata.path ?? metadata.cwd, problems);
-    const commit = readCommitFromMetadata(metadata.providerMetadata);
+    const commit = readPinnedGitObjectId(metadata.providerMetadata);
     const repoRef = readRepoRef(metadata.providerMetadata);
     if (commit === null || repoRef === null) problems.push("commit_pin_unverified");
     if (metadata.path === null) problems.push("workspace_not_locally_realized");

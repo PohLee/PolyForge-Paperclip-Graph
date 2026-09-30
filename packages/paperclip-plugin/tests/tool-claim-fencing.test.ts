@@ -1,7 +1,6 @@
 /**
- * AT-06 — claim, lease epoch, fencing, the six tools, and fast pending responses.
- * (docs/03 §10 AT-06: "claim 过期/leaseEpoch fencing/跨 run claim 拒绝/同 agent 重入/工具 6 个且与 manifest 一致/
- *  工具返回快，pending/不返回 sync commit")
+ * Tool/claim contract — lease epochs, fencing, the six tools, and fast pending responses.
+ * This is not docs/03 §10 AT-06 (workspace isolation); see the requirements matrix for that gate.
  *
  * ## Harness limits
  *
@@ -16,6 +15,7 @@
 
 import "./helpers/bootstrap.ts";
 import { strict as assert } from "node:assert";
+import { createHash } from "node:crypto";
 import { after, test } from "node:test";
 import { load } from "./helpers/bootstrap.ts";
 
@@ -28,10 +28,10 @@ const sdk = await load<typeof import("@paperclipai/plugin-sdk")>("@paperclipai/p
 
 const { COMPANY_A, PROJECT_A, GRAPH_ID, ENTRYPOINT, buildBridge, company, project, issue, label } = h;
 const bridges: { dispose(): void }[] = [];
-after(() => {
-  for (const bridge of bridges) bridge.dispose();
+after(async () => {
+  for (const bridge of bridges) await bridge.dispose();
 });
-function track<T extends { dispose(): void }>(bridge: T): T {
+function track<T extends { dispose(): Promise<void> }>(bridge: T): T {
   bridges.push(bridge);
   return bridge;
 }
@@ -184,7 +184,7 @@ function stripDescriptions(value: unknown): unknown {
 // REQ-TOOL-01 / REQ-TOOL-02: exactly six tools, in sync with the manifest
 // ---------------------------------------------------------------------------
 
-test("AT-06: the registered tool set is exactly the manifest's, with the manifest's declarations", async () => {
+ test("TOOL: the registered tool set is exactly the manifest's, with the manifest's declarations", async () => {
   const bridge = track(await withWorkUnit());
   const registered = [...bridge.tools.keys()].sort();
   const declared = (h.manifest.tools ?? []).map((tool) => tool.name).sort();
@@ -215,9 +215,18 @@ test("AT-06: the registered tool set is exactly the manifest's, with the manifes
     );
   }
   assert.deepEqual(register.REGISTERED_TOOL_NAMES.slice().sort(), declared);
+  const artifactTool = h.manifest.tools?.find((tool) => tool.name === "submit_artifact");
+  const artifactSchema = artifactTool?.parametersSchema as {
+    properties?: { artifacts?: { items?: { properties?: { source?: { properties?: { kind?: { enum?: string[] } } } } } } };
+  };
+  assert.deepEqual(
+    artifactSchema.properties?.artifacts?.items?.properties?.source?.properties?.kind?.enum,
+    ["document", "inline"],
+    "attachment uploads stay out of the agent tool schema until the host capability is granted",
+  );
 });
 
-test("AT-06: every tool response is the protocol envelope, with the declared fields and nothing else", async () => {
+ test("TOOL: every tool response is the protocol envelope, with the declared fields and nothing else", async () => {
   const bridge = track(await withWorkUnit());
   await bridge.callTool("current", { adopt: true }, runCtx());
   const calls = [
@@ -243,10 +252,10 @@ test("AT-06: every tool response is the protocol envelope, with the declared fie
 });
 
 // ---------------------------------------------------------------------------
-// AT-06: claim, epoch, fencing
+ // Claim, epoch, fencing
 // ---------------------------------------------------------------------------
 
-test("AT-06: reading the contract without adopting claims nothing and says what to do next", async () => {
+ test("CLAIM: reading the contract without adopting claims nothing and says what to do next", async () => {
   const bridge = track(await withWorkUnit());
   const result = await bridge.callTool("current", {}, runCtx());
   assert.equal(result.error, undefined);
@@ -263,17 +272,17 @@ test("AT-06: reading the contract without adopting claims nothing and says what 
   assert.equal(bridge.runtime.requestsTo("POST", "/claims").length, 0);
 });
 
-test("AT-06: adopting claims the attempt, advances the epoch, and records the claim durably", async () => {
+ test("CLAIM: adopting claims the attempt, advances the epoch, and records the claim durably", async () => {
   const bridge = track(await withWorkUnit());
   const data = envelope(await bridge.callTool("current", { adopt: true }, runCtx()));
   assert.equal(data["status"], "CLAIMED");
   assert.equal(claimOf(data)["leaseEpoch"], 1);
   assert.equal(claimOf(data)["previousLeaseEpoch"], 0);
   assert.equal(claimOf(data)["invalidatesPreviousAttempt"], true);
-  // The Core actually received the fence: epoch 0 presented, epoch 1 granted.
+  // The Core actually received the next-epoch fence: epoch 1 requested and granted.
   const claims = bridge.runtime.claims;
   assert.equal(claims.length, 1);
-  assert.equal(claims[0]?.["presentedLeaseEpoch"], 0);
+  assert.equal(claims[0]?.["presentedLeaseEpoch"], 1);
   assert.equal(claims[0]?.["grantedEpoch"], 1);
   assert.equal(claims[0]?.["granted"], true);
   assert.equal(claims[0]?.["agentSubject"], `agent:paperclip/${AGENT_ID}`);
@@ -285,7 +294,7 @@ test("AT-06: adopting claims the attempt, advances the epoch, and records the cl
   assert.equal(payload["agentRunId"], AGENT_RUN);
 });
 
-test("AT-06: the same agent run re-entering gets its own claim back, not a second epoch", async () => {
+ test("CLAIM: the same agent run re-entering gets its own claim back, not a second epoch", async () => {
   const bridge = track(await withWorkUnit());
   await bridge.callTool("current", { adopt: true }, runCtx());
   // A second adopt by the same agent run is ordinary, not adversarial. It must not burn an epoch:
@@ -306,14 +315,26 @@ test("AT-06: the same agent run re-entering gets its own claim back, not a secon
   assert.equal(envelope(evidence)["status"], "PENDING");
 });
 
-test("AT-06: a second agent run is fenced out while the lease is live", async () => {
+test("AT-28: lease expiry alone does not admit a second owner while the old agent run is live", async () => {
   const bridge = track(await withWorkUnit());
   await bridge.callTool("current", { adopt: true }, runCtx());
+  const leaseAge = bridge.runtime.leaseTtlMs + 1;
+  bridge.runtime.advanceClock(leaseAge);
+  bridge.advanceClock(leaseAge);
+  const held = bridge.runtime.leases.get("run-1|n1|0");
+  assert.ok(held && held.expiresAtMs <= bridge.runtime.nowMs(), "the Core lease must actually be expired");
+  // The provider confirms that the previous agent run is still active. A live host run must
+  // produce UNKNOWN and stop before the Runtime claim call, even though the Core lease expired.
+  bridge.harness.seed({
+    issues: [issue("root-1", COMPANY_A, PROJECT_A, {
+      activeRun: { id: AGENT_RUN, status: "running", agentId: AGENT_ID },
+    })],
+  });
   // A stale duplicate dispatch of the same node to a different agent run: it has a work unit of
   // its own, so the scope check passes and the lease is what must stop it.
   dispatchIntruder(bridge);
   const data = envelope(await bridge.callTool("current", { adopt: true }, intruderCtx()));
-  // The Core holds the lease for another agent run and has not expired it, so adoption fails.
+  // The provider stop check is unknown, so adoption fails before Core mutation.
   assert.notEqual(data["status"], "CLAIMED");
   assert.ok(
     ["CLAIM_REFUSED", "LEASE_FENCED", "PENDING", "LEASE_NOT_FENCED"].includes(String(data["status"])),
@@ -321,27 +342,27 @@ test("AT-06: a second agent run is fenced out while the lease is live", async ()
   );
   const blockers = data["blockers"] as Record<string, unknown>[];
   assert.equal(blockers[0]?.["reason"], "BLOCKED_LEASE_FENCED");
-  // The refusal came from the Core, not from the bridge's own opinion of its store.
-  const refused = bridge.runtime.claims.filter((entry) => entry["granted"] === false);
-  assert.equal(refused.length, 1);
-  assert.equal(refused[0]?.["reason"], "LEASE_HELD");
+  assert.equal(bridge.runtime.claims.length, 1, "only the first agent's initial claim may reach Core");
   // The live lease still belongs to the first agent run.
   assert.equal(bridge.runtime.leases.get("run-1|n1|0")?.agentRunId, AGENT_RUN);
 });
 
-test("AT-06: an expired lease can be taken over, and the epoch still advances", async () => {
+test("CLAIM: a host-confirmed stop permits takeover and advances the epoch", async () => {
   const bridge = track(await withWorkUnit());
   await bridge.callTool("current", { adopt: true }, runCtx());
   dispatchIntruder(bridge);
-  // The first worker's lease expires — it crashed, or the platform lost it. The bridge itself
-  // cannot tell the difference, which is why it asks the Core rather than deciding from a timer.
-  bridge.runtime.expireLeases();
+  // A lease may still be live; the host observation that no run remains is what permits takeover.
   const data = envelope(await bridge.callTool("current", { adopt: true }, intruderCtx()));
   assert.equal(data["status"], "CLAIMED");
   // Takeover is not a silent overwrite: the epoch moves, so the old attempt is fenced.
   assert.equal(claimOf(data)["leaseEpoch"], 2);
   assert.equal(claimOf(data)["previousLeaseEpoch"], 1);
   assert.equal(claimOf(data)["invalidatesPreviousAttempt"], true);
+  const takeover = bridge.runtime.claims.at(-1);
+  assert.equal(takeover?.["leaseEpoch"], 2, "the bridge presents the next epoch expected by Core");
+  assert.equal(takeover?.["priorWorkerState"], "stopped");
+  assert.equal(takeover?.["submittedAttemptId"], undefined, "Core must allocate a fresh attempt id");
+  assert.notEqual(takeover?.["attemptId"], "attempt-1");
   // And the first agent run is now fenced on its own next write.
   const fenced = await bridge.callTool(
     "submit_evidence",
@@ -352,7 +373,7 @@ test("AT-06: an expired lease can be taken over, and the epoch still advances", 
   assert.equal(blockers[0]?.["reason"], "BLOCKED_LEASE_FENCED");
 });
 
-test("AT-06: a write from a fenced agent run is refused even though it knows the run id", async () => {
+ test("CLAIM: a write from a fenced agent run is refused even though it knows the run id", async () => {
   const bridge = track(await withWorkUnit());
   await bridge.callTool("current", { adopt: true }, runCtx());
   dispatchIntruder(bridge);
@@ -371,7 +392,7 @@ test("AT-06: a write from a fenced agent run is refused even though it knows the
   assert.equal(bridge.store.countDeliveries(COMPANY_A, "pending"), 0);
 });
 
-test("AT-06: an unbound agent run cannot call any side-effecting tool", async () => {
+ test("CLAIM: an unbound agent run cannot call any side-effecting tool", async () => {
   const bridge = track(await withWorkUnit());
   for (const [name, params] of [
     ["submit_artifact", { nodeId: "n1", artifacts: [{ kind: "code_diff", contentHash: "sha256:x" }] }],
@@ -388,7 +409,7 @@ test("AT-06: an unbound agent run cannot call any side-effecting tool", async ()
   assert.equal(bridge.store.countDeliveries(COMPANY_A, "pending"), 0);
 });
 
-test("AT-06: a tool call naming a run this agent run is not bound to is a scope violation", async () => {
+ test("CLAIM: a tool call naming a run this agent run is not bound to is a scope violation", async () => {
   const bridge = track(await withWorkUnit());
   bridge.runtime.seedRun("run-other", { scope: { companyRef: COMPANY_A, projectRef: PROJECT_A } });
   const data = envelope(
@@ -401,7 +422,7 @@ test("AT-06: a tool call naming a run this agent run is not bound to is a scope 
   assert.equal(bridge.runtime.requestsTo("GET", "/runs/run-other").length, 0);
 });
 
-test("AT-06: a claim for a company with no work unit is refused before the Core is asked", async () => {
+ test("CLAIM: a claim for a company with no work unit is refused before the Core is asked", async () => {
   const bridge = track(
     await buildBridge({
       extraCompanyIds: ["company-b"],
@@ -420,7 +441,7 @@ test("AT-06: a claim for a company with no work unit is refused before the Core 
   assert.equal(bridge.runtime.requests.length, 0);
 });
 
-test("AT-06: a claim the Core grants without advancing the epoch is refused", async () => {
+ test("CLAIM: a claim the Core grants without advancing the epoch is refused", async () => {
   // The Core is the only authority on epochs. If a claim comes back with the old epoch the old
   // attempt is still live, so the bridge must not proceed on the belief that it fenced anything.
   const bridge = track(await withWorkUnit());
@@ -451,7 +472,7 @@ test("AT-06: a claim the Core grants without advancing the epoch is refused", as
   assert.equal(bridge.store.getBinding(COMPANY_A, register.CLAIM_BINDING_KIND, "run-1:n1:0"), null);
 });
 
-test("AT-06: adoption is refused when the previous owner's stop cannot be confirmed", async () => {
+ test("CLAIM: adoption is refused when the previous owner's stop cannot be confirmed", async () => {
   // The realistic shape: the previous owner is a dispatched agent run whose issue still has a
   // live run. The host baseline exposes no execution-stop API to plugins, so the stop cannot be
   // confirmed, and "cannot confirm" must block adoption rather than be read as "it is fine".
@@ -527,7 +548,34 @@ test("AT-06: adoption is refused when the previous owner's stop cannot be confir
   );
 });
 
-test("AT-06: a node the Core reports as not claimable cannot be claimed", async () => {
+test("AT-28: a terminal Issue with a still-running activeRun cannot be adopted", async () => {
+  const bridge = track(await withWorkUnit({ current: { previousOwnerAgentRunId: "agent-run-old" } }));
+  bridge.store.putBinding({
+    companyId: COMPANY_A,
+    kind: "dispatch",
+    providerId: "agent-run-old",
+    projectId: PROJECT_A,
+    payload: { agentRunRefId: "agent-run-old", issueId: "root-1", runId: "run-previous" },
+  });
+  // Board status and process state are separate facts: someone can mark the Issue done while the
+  // host still says its heartbeat is running. The live execution must win for takeover safety.
+  bridge.harness.seed({
+    issues: [
+      issue("root-1", COMPANY_A, PROJECT_A, {
+        status: "done",
+        activeRun: { id: "agent-run-old", status: "running", agentId: "agent-old" },
+      } as never),
+    ],
+  });
+
+  const data = envelope(await bridge.callTool("current", { adopt: true }, runCtx()));
+  assert.equal(data["status"], "PENDING");
+  assert.equal(data["pendingReason"], "previous_owner_stop_unconfirmed");
+  assert.equal(bridge.runtime.claims.length, 0, "no new lease may be claimed while the old heartbeat runs");
+  assert.ok((bridge.counters()["platformBlocks"] as number) >= 1);
+});
+
+ test("CLAIM: a node the Core reports as not claimable cannot be claimed", async () => {
   const bridge = track(await withWorkUnit({ current: { claimable: false } }));
   const data = envelope(await bridge.callTool("current", { adopt: true }, runCtx()));
   assert.equal(data["status"], "NOT_CLAIMABLE");
@@ -537,10 +585,10 @@ test("AT-06: a node the Core reports as not claimable cannot be claimed", async 
 });
 
 // ---------------------------------------------------------------------------
-// AT-06 / REQ-TOOL-05: tools return fast, with a durable pending result
+ // REQ-TOOL-05: tools return fast, with a durable pending result
 // ---------------------------------------------------------------------------
 
-test("AT-06: a submitted evidence candidate is pending, and the producer is derived not asserted", async () => {
+ test("TOOL: a submitted evidence candidate is pending, and the producer is derived not asserted", async () => {
   const bridge = track(await withWorkUnit());
   await bridge.callTool("current", { adopt: true }, runCtx());
   const data = envelope(
@@ -577,7 +625,7 @@ test("AT-06: a submitted evidence candidate is pending, and the producer is deri
   assert.equal(evidence[0]?.signatureValid, true);
 });
 
-test("AT-06: an artifact whose declared digest does not match the host bytes is refused", async () => {
+ test("TOOL: an artifact whose declared digest does not match the host bytes is refused", async () => {
   const bridge = track(await withWorkUnit());
   await bridge.callTool("current", { adopt: true }, runCtx());
   const data = envelope(
@@ -605,7 +653,58 @@ test("AT-06: an artifact whose declared digest does not match the host bytes is 
   assert.equal(bridge.runtime.requestsTo("POST", "/artifacts").length, 0);
 });
 
-test("AT-06: a transition request without a claim is refused with a recovery hint", async () => {
+test("TOOL: a verified document artifact carries its source revision and immutable snapshot to Core", async () => {
+  const bridge = track(await withWorkUnit());
+  const sourceBody = "verified tool artifact\n";
+  const sourceDocument = await bridge.ctx.issues.documents.upsert({
+    issueId: "root-1",
+    key: "spec",
+    companyId: COMPANY_A,
+    body: sourceBody,
+    changeSummary: "seed artifact source",
+  });
+  const contentHash = `sha256:${createHash("sha256").update(sourceBody, "utf8").digest("hex")}`;
+
+  await bridge.callTool("current", { adopt: true }, runCtx());
+  const result = envelope(
+    await bridge.callTool(
+      "submit_artifact",
+      {
+        nodeId: "n1",
+        artifacts: [
+          {
+            kind: "code_diff",
+            contentHash,
+            mediaType: "text/markdown",
+            size: sourceBody.length,
+            source: { kind: "document", ref: "spec" },
+          },
+        ],
+      },
+      runCtx(),
+    ),
+  );
+
+  assert.equal(result["status"], "PENDING");
+  const artifacts = bridge.runtime.requestsTo("POST", "/artifacts");
+  assert.equal(artifacts.length, 1);
+  const request = artifacts[0]!;
+  assert.equal(request.signatureValid, true);
+  const body = JSON.parse(request.bodyText) as Record<string, unknown>;
+  const payload = body["payload"] as Record<string, unknown>;
+  const submitted = (payload["artifacts"] as Record<string, unknown>[])[0]!;
+  assert.equal(submitted["contentHash"], contentHash);
+  assert.deepEqual(submitted["source"], {
+    kind: "document",
+    ref: "issue:root-1/spec",
+    revision: sourceDocument.latestRevisionId,
+  });
+  const providerRef = submitted["providerRef"] as Record<string, unknown>;
+  assert.equal(providerRef["kind"], "issue_document_revision");
+  assert.match(String(providerRef["id"]), /^polyforge\/artifact-/);
+});
+
+ test("TOOL: a transition request without a claim is refused with a recovery hint", async () => {
   const bridge = track(await withWorkUnit());
   const data = envelope(await bridge.callTool("request_transition", { nodeId: "n1", evidenceIds: ["ev-1"] }, runCtx()));
   assert.equal(data["status"], "NO_CLAIM");
@@ -616,7 +715,7 @@ test("AT-06: a transition request without a claim is refused with a recovery hin
   assert.equal(bridge.runtime.requestsTo("POST", "/transitions").length, 0);
 });
 
-test("AT-06: a transition request names the evidence it wants judged, and nothing else", async () => {
+ test("TOOL: a transition request names the evidence it wants judged, and nothing else", async () => {
   const bridge = track(await withWorkUnit());
   await bridge.callTool("current", { adopt: true }, runCtx());
   const result = await bridge.callTool(
@@ -656,7 +755,7 @@ test("AT-06: a transition request names the evidence it wants judged, and nothin
   assert.equal(transitions[0]?.signatureValid, true);
 });
 
-test("AT-06: status is a read of the Core and needs no claim", async () => {
+ test("TOOL: status is a read of the Core and needs no claim", async () => {
   const bridge = track(await withWorkUnit());
   const data = envelope(await bridge.callTool("status", {}, runCtx()));
   assert.equal(data["status"], "ACTIVE", "the run's own status, never a node verdict");
@@ -671,7 +770,7 @@ test("AT-06: status is a read of the Core and needs no claim", async () => {
   assert.ok(bridge.runtime.requestsTo("GET", "/runs/run-1").length >= 1);
 });
 
-test("AT-06: help is a pending intent that implies no approval and waits on nothing", async () => {
+ test("TOOL: help is a pending intent that implies no approval and waits on nothing", async () => {
   const bridge = track(await withWorkUnit());
   await bridge.callTool("current", { adopt: true }, runCtx());
   const data = envelope(
@@ -688,7 +787,7 @@ test("AT-06: help is a pending intent that implies no approval and waits on noth
   assert.equal(bridge.runtime.requestsTo("POST", "/interactions").length, 0);
 });
 
-test("AT-06: a help kind outside the vocabulary is refused rather than coerced", async () => {
+ test("TOOL: a help kind outside the vocabulary is refused rather than coerced", async () => {
   const bridge = track(await withWorkUnit());
   await bridge.callTool("current", { adopt: true }, runCtx());
   const data = envelope(

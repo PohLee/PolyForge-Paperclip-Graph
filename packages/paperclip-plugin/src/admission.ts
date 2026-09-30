@@ -32,11 +32,12 @@
  */
 
 import { digestText, hashDomain, canonicalJson } from "@polyforge/protocol";
-import type { Scope } from "@polyforge/protocol";
+import type { Scope, WorkspaceRequirement } from "@polyforge/protocol";
 import type { Issue } from "@paperclipai/plugin-sdk";
 import type { BridgeConfig } from "./config.js";
 import type { BridgeLogger } from "./logger.js";
 import type { BridgeMetrics } from "./metrics.js";
+import { isFullGitObjectId } from "./workspace-metadata.ts";
 
 /** The fence that marks a work-order intent in an issue body. */
 export const WORK_ORDER_INTENT_MARKER = "polyforge:work-order";
@@ -45,6 +46,8 @@ export interface WorkOrderIntentBlock {
   readonly graphId: string;
   readonly entrypoint: string;
   readonly inputSnapshot: Record<string, unknown>;
+  readonly workspaceRequirement: WorkspaceRequirement | null;
+  readonly requiredFactSources: Record<string, { sourceRunId: string }>;
   /** Explicitly declared by the author, so a new run can be requested deliberately. */
   readonly startIntentId: string | null;
   /** Fields the author tried to set that the bridge refuses. Recorded, never used. */
@@ -69,6 +72,8 @@ export type AdmissionDecision =
       readonly projectId: string;
       readonly rootIssueId: string;
       readonly inputSnapshot: Record<string, unknown>;
+      readonly workspaceRequirement: WorkspaceRequirement | null;
+      readonly requiredFactSources: Record<string, { sourceRunId: string }>;
       readonly trigger: "origin_kind" | "entry_label" | "body_intent";
     }
   | {
@@ -174,6 +179,8 @@ export class AdmissionGate {
       projectId,
       rootIssueId: issue.id,
       inputSnapshot: block?.inputSnapshot ?? {},
+      workspaceRequirement: block?.workspaceRequirement ?? null,
+      requiredFactSources: block?.requiredFactSources ?? {},
       trigger: block !== null ? "body_intent" : originMatches ? "origin_kind" : "entry_label",
     };
   }
@@ -203,6 +210,8 @@ export function deriveStartIntentId(
       issueId,
       graphId,
       entrypoint,
+      workspaceRequirement: block.workspaceRequirement,
+      requiredFactSources: block.requiredFactSources,
     });
   }
   return hashDomain("pf.start-intent", {
@@ -210,7 +219,11 @@ export function deriveStartIntentId(
     issueId,
     graphId,
     entrypoint,
-    ...(block === null ? {} : { intentDigest: digestText(canonicalJson(block.inputSnapshot)) }),
+    ...(block === null ? {} : {
+      intentDigest: digestText(canonicalJson(block.inputSnapshot)),
+      workspaceRequirement: block.workspaceRequirement,
+      requiredFactSources: block.requiredFactSources,
+    }),
   });
 }
 
@@ -266,13 +279,92 @@ export function parseWorkOrderIntent(
     typeof record["inputSnapshot"] === "object" && record["inputSnapshot"] !== null && !Array.isArray(record["inputSnapshot"])
       ? (record["inputSnapshot"] as Record<string, unknown>)
       : {};
+  const workspaceRequirement = readWorkspaceRequirement(record["workspaceRequirement"], logger);
+  if (record["workspaceRequirement"] !== undefined && workspaceRequirement === null) return null;
+  const requiredFactSources = readRequiredFactSources(record["requiredFactSources"], logger);
+  if (record["requiredFactSources"] !== undefined && requiredFactSources === null) return null;
 
   if (graphId === null || entrypoint === null) {
     logger.warn("work-order intent block must name both graphId and entrypoint; refusing to admit from it");
     return null;
   }
 
-  return { graphId, entrypoint, inputSnapshot, startIntentId, rejectedFields };
+  return {
+    graphId,
+    entrypoint,
+    inputSnapshot,
+    workspaceRequirement,
+    requiredFactSources: requiredFactSources ?? {},
+    startIntentId,
+    rejectedFields,
+  };
+}
+
+function readRequiredFactSources(
+  value: unknown,
+  logger: BridgeLogger,
+): Record<string, { sourceRunId: string }> | null {
+  if (value === undefined) return null;
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    logger.warn("work-order requiredFactSources must be an object; refusing this intent");
+    return null;
+  }
+  const result: Record<string, { sourceRunId: string }> = {};
+  for (const [fact, raw] of Object.entries(value as Record<string, unknown>)) {
+    if (
+      fact.trim().length === 0 || ["__proto__", "constructor", "prototype"].includes(fact) ||
+      typeof raw !== "object" || raw === null || Array.isArray(raw) ||
+      Object.keys(raw as Record<string, unknown>).length !== 1 ||
+      typeof (raw as Record<string, unknown>)["sourceRunId"] !== "string" ||
+      ((raw as Record<string, unknown>)["sourceRunId"] as string).trim().length === 0
+    ) {
+      logger.warn("each required fact source must name only one non-empty sourceRunId; refusing this intent", { fact });
+      return null;
+    }
+    result[fact] = { sourceRunId: ((raw as Record<string, unknown>)["sourceRunId"] as string).trim() };
+  }
+  return result;
+}
+
+function readWorkspaceRequirement(value: unknown, logger: BridgeLogger): WorkspaceRequirement | null {
+  if (value === undefined) return null;
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    logger.warn("work-order workspaceRequirement must be an object; refusing this intent");
+    return null;
+  }
+  const record = value as Record<string, unknown>;
+  if (Object.keys(record).some((key) => !["mode", "repositories", "requireReadOnlyForReviewer"].includes(key))) {
+    logger.warn("work-order workspaceRequirement contains unsupported fields; refusing this intent");
+    return null;
+  }
+  const repositories = record["repositories"];
+  if (
+    record["mode"] !== "read_write" || record["requireReadOnlyForReviewer"] !== false ||
+    !Array.isArray(repositories) || repositories.length !== 1
+  ) {
+    logger.warn("work-order workspaceRequirement must request one writable repository without reviewer sharing");
+    return null;
+  }
+  const repository = repositories[0];
+  if (typeof repository !== "object" || repository === null || Array.isArray(repository)) {
+    logger.warn("work-order repository pin is malformed; refusing this intent");
+    return null;
+  }
+  const repo = repository as Record<string, unknown>;
+  if (
+    Object.keys(repo).some((key) => !["repoRef", "baseRef", "commit"].includes(key)) ||
+    typeof repo["repoRef"] !== "string" || repo["repoRef"].trim().length === 0 ||
+    typeof repo["baseRef"] !== "string" || repo["baseRef"].trim().length === 0 ||
+    !isFullGitObjectId(repo["commit"])
+  ) {
+    logger.warn("work-order repository pin needs a repoRef, baseRef, and full Git object ID commit");
+    return null;
+  }
+  return {
+    mode: "read_write",
+    repositories: [{ repoRef: repo["repoRef"], baseRef: repo["baseRef"], commit: repo["commit"].toLowerCase() }],
+    requireReadOnlyForReviewer: false,
+  };
 }
 
 /** Render the intent block an operator can paste into a Root Issue description. */
@@ -280,6 +372,8 @@ export function renderWorkOrderIntentBlock(intent: {
   graphId: string;
   entrypoint: string;
   inputSnapshot?: Record<string, unknown>;
+  workspaceRequirement?: WorkspaceRequirement;
+  requiredFactSources?: Record<string, { sourceRunId: string }>;
   startIntentId?: string;
 }): string {
   return [
@@ -289,6 +383,8 @@ export function renderWorkOrderIntentBlock(intent: {
         graphId: intent.graphId,
         entrypoint: intent.entrypoint,
         ...(intent.inputSnapshot ? { inputSnapshot: intent.inputSnapshot } : {}),
+        ...(intent.workspaceRequirement ? { workspaceRequirement: intent.workspaceRequirement } : {}),
+        ...(intent.requiredFactSources ? { requiredFactSources: intent.requiredFactSources } : {}),
         ...(intent.startIntentId ? { startIntentId: intent.startIntentId } : {}),
       },
       null,

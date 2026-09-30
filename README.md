@@ -31,22 +31,22 @@ docs/                          the migration specification pack
 ## Quick start
 
 ```bash
-# 1. Python Graph Core + Runtime Service tests
-make test-core
+# 1. Full local verification (Node typecheck/build/plugin tests, Python Core suite, graph lock)
+npm run verify
 
 # 2. Runtime Service on 127.0.0.1:8787
-make run-service
+tools/px.sh tools/run-service.sh
 
 # 3. Build and install the plugin into the local Paperclip instance
-make plugin-build
-make plugin-install
+tools/px.sh tools/stage-plugin.sh
+tools/px.sh tools/install-plugin.sh
 
-# 4. Full local verification (unit → contract → host probe → e2e)
-make verify
+# 4. Provision the company-scoped pilot configuration and graph library
+tools/px.sh tools/provision-pilot.sh <companyId>
 ```
 
-See [`docs/06-OPERATIONS.md`](docs/06-OPERATIONS.md) for the runbooks, the cutover procedure, and the
-rollback procedure.
+See [`docs/06-OPERATIONS.md`](docs/06-OPERATIONS.md) for the runbooks, live host capability probe,
+cutover procedure, and rollback procedure.
 
 ## Invariants this codebase enforces
 

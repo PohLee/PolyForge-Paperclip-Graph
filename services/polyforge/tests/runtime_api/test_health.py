@@ -45,7 +45,7 @@ def work_order(start_intent: str) -> dict:
         "rootIssueRef": {"provider": "paperclip", "kind": "issue", "id": "issue-1"},
         "inputSnapshot": {"requirement_baseline": {"id": "rb-1"}},
         "requiredFacts": {
-            "requirement_gate_passed": {
+            "requirement_acceptance": {
                 "source": "imp-1",
                 "sourceRevision": "rev-7",
                 "contentHash": "sha256:" + "ab" * 32,

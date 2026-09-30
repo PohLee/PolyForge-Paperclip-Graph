@@ -34,7 +34,7 @@ _DEFINITION: Final[dict[str, Any]] = {
         "design.start": {
             "key": "design.start",
             "inputs": ["requirement_baseline"],
-            "requiresFacts": ["requirement_gate_passed"],
+            "requiresFacts": ["requirement_acceptance"],
             "coordinator": {
                 "requiredCapabilities": ["design.coordinate"],
                 "preferredRoles": ["designer"],

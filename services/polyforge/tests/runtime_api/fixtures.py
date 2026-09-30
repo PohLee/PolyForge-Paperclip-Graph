@@ -244,10 +244,11 @@ class RuntimeApiCase(unittest.TestCase):
     """
 
     config_overrides: Mapping[str, Any] = {}
+    database_path = ":memory:"
 
     def setUp(self) -> None:
         self.clock = ids.FrozenClock("2026-01-01T00:00:00.000Z")
-        self.db = Database(":memory:", clock=self.clock)
+        self.db = Database(self.database_path, clock=self.clock)
         self.db.migrate()
         atexit.register(self.db.close)
         self.registry = RegistryStore(self.db, clock=self.clock)
@@ -259,7 +260,7 @@ class RuntimeApiCase(unittest.TestCase):
             bridge_expected_issuer=ISSUER,
         )
         self.config = ServiceConfig(
-            db=":memory:",
+            db=self.database_path,
             bind="127.0.0.1",
             port=0,
             bridge_issuer=ISSUER,
@@ -304,14 +305,22 @@ class RuntimeApiCase(unittest.TestCase):
             target=server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True
         )
         thread.start()
+        stopped = False
 
         def _stop() -> None:
+            nonlocal stopped
+            if stopped:
+                return
+            stopped = True
             # ``shutdown`` first: ``server_close`` alone closes the listening socket, which
             # leaves ``serve_forever`` spinning on a dead selector until the join times out.
             server.shutdown()
             thread.join(5.0)
             server.server_close()
 
+        if not hasattr(self, "_server_stoppers"):
+            self._server_stoppers: list[Any] = []
+        self._server_stoppers.append(_stop)
         self.addCleanup(_stop)
         return f"http://127.0.0.1:{server.server_address[1]}"
 

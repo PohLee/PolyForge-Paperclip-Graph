@@ -19,6 +19,7 @@ import type {
 } from "./enums.js";
 import type { ErrorCode } from "./errors.js";
 import type { CommandMeta, ProviderRefLike, Scope } from "./port-types.js";
+import type { WorkspaceRequirement } from "./ports.js";
 
 export const PROTOCOL_VERSION = 1;
 
@@ -385,9 +386,34 @@ export interface CreateWorkOrderRequest extends CommandMeta {
   entrypoint: string;
   rootIssueRef: ProviderRefLike;
   inputSnapshot: Record<string, unknown>;
+  /** Optional human-authored, host-validated run pin applied only to code.modify nodes. */
+  workspaceRequirement?: WorkspaceRequirement;
+  /**
+   * The effective policy closure pinned to this work order. The bridge supplies the narrow
+   * Paperclip admission rule only after a board user starts the run; later node actions still
+   * require their own matching rules and remain deny-first when none are supplied.
+   */
+  policyRules?: WorkOrderPolicyRule[];
   /** Optional external prerequisite facts; each must carry verifiable provenance. */
   requiredFacts?: Record<string, { source: string; sourceRevision: string; contentHash: string }>;
+  /** Fact names mapped to a same-project completed source Run; Core resolves and verifies its Gate export. */
+  requiredFactSources?: Record<string, { sourceRunId: string }>;
   sourceRef?: ProviderRefLike | null;
+}
+
+export interface WorkOrderPolicyRule {
+  ruleId: string;
+  effect: "allow" | "deny" | "require_approval";
+  agentRef?: string | null;
+  projectRef: string;
+  workflowRef: string;
+  transitionRef: string;
+  actions: string[];
+  resources: string[];
+  environments: string[];
+  requiredCapabilities?: string[];
+  version?: string;
+  reason: string;
 }
 
 export interface ClaimRequest {

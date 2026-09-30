@@ -10,6 +10,7 @@
 
 import type { ReactNode } from "react";
 import { useHostNavigation } from "@paperclipai/plugin-sdk/ui";
+import { polyForgePageHref } from "../routes.js";
 import type { HealthData, RunListItem } from "@polyforge/protocol";
 import { formatInstantPair } from "../format.js";
 import { useHealth, useRuntimeRuns } from "../hooks/usePolyForge.js";
@@ -121,10 +122,10 @@ function RunTally(props: { runs: import("../hooks/usePolyForge.js").PolyForgeQue
   );
 }
 
-export function PolyForgeSidebar(): ReactNode {
+export function PolyForgeSidebar(props: { pluginId: string }): ReactNode {
   const navigation = useHostNavigation();
   const health = useHealth();
-  const linkProps = navigation.linkProps("/plugins/polyforge#health");
+  const linkProps = navigation.linkProps(polyForgePageHref(props.pluginId));
 
   return (
     <nav aria-label="PolyForge">

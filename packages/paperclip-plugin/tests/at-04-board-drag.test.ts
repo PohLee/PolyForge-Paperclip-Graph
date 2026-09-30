@@ -20,10 +20,10 @@ const enums = await load<typeof import("@polyforge/protocol")>("@polyforge/proto
 
 const { COMPANY_A, PROJECT_A, GRAPH_ID, ENTRYPOINT, buildBridge, company, project, issue, label, hostEvent } = h;
 const bridges: { dispose(): void }[] = [];
-after(() => {
-  for (const bridge of bridges) bridge.dispose();
+after(async () => {
+  for (const bridge of bridges) await bridge.dispose();
 });
-function track<T extends { dispose(): void }>(bridge: T): T {
+function track<T extends { dispose(): Promise<void> }>(bridge: T): T {
   bridges.push(bridge);
   return bridge;
 }
@@ -223,7 +223,7 @@ test("AT-04: an external cancel is a control request, and history is kept", asyn
   assert.equal(bridge.runtime.runs.size, 1);
 });
 
-test("AT-04: a budget incident is BLOCKED_BUDGET and the bridge does not route around it", async () => {
+test("AT-04/AT-10: a budget incident blocks and creates no work-dispatch intent", async () => {
   const bridge = await bridgeWithRun();
   await bridge.eventPump.handle(
     hostEvent("budget.incident.opened", "evt-budget-1", {
@@ -239,6 +239,11 @@ test("AT-04: a budget incident is BLOCKED_BUDGET and the bridge does not route a
   assert.equal(payload["blockReason"], "BLOCKED_BUDGET");
   // Switching agents to dodge a financial hard stop is explicitly forbidden.
   assert.equal(payload["bridgeMayWorkAround"], false);
+  assert.equal(
+    bridge.runtime.coreIntents.filter((intent) => intent.kind === "work.dispatch").length,
+    0,
+    "a hard stop must not enqueue an assignment/wakeup intent",
+  );
 });
 
 test("AT-04: an agent made unavailable is a platform block, not a retryable wobble", async () => {
@@ -254,7 +259,7 @@ test("AT-04: an agent made unavailable is a platform block, not a retryable wobb
   assert.equal(payload["retryableByBridge"], false);
 });
 
-test("AT-04: a deleted workspace is BLOCKED_WORKSPACE, and a new directory is not the old state", async () => {
+test("AT-07: a replacement workspace does not resume work after the original is deleted", async () => {
   const bridge = await bridgeWithRun();
   await bridge.eventPump.handle(
     hostEvent("project.workspace_deleted", "evt-ws-deleted", { workspaceId: "pw-1", projectId: PROJECT_A }),
@@ -265,6 +270,26 @@ test("AT-04: a deleted workspace is BLOCKED_WORKSPACE, and a new directory is no
   const payload = event["payload"] as Record<string, unknown>;
   assert.equal(payload["blockReason"], "BLOCKED_WORKSPACE");
   assert.equal(payload["newDirectoryIsNotTheOldState"], true);
+
+  // A later workspace-created observation is only a refetch hint. Reusing the project must not
+  // silently resume the stale run or create an assignment for a replacement directory.
+  await bridge.eventPump.handle(
+    hostEvent("project.workspace_created", "evt-ws-replaced", {
+      workspaceId: "pw-replacement",
+      projectId: PROJECT_A,
+    }),
+  );
+  await bridge.drain();
+  const replacement = bridge.runtime.intake.at(-1) as Record<string, unknown>;
+  const replacementPayload = replacement["payload"] as Record<string, unknown>;
+  assert.equal(replacement["type"], "pf.execution.observed");
+  assert.equal(replacementPayload["observationOnly"], true);
+  assert.equal(replacementPayload["observationKind"], "project.workspace_created");
+  assert.equal(
+    bridge.runtime.coreIntents.filter((intent) => intent.kind === "work.dispatch").length,
+    0,
+    "a replacement workspace is not proof that the pinned input and artifacts were restored",
+  );
 });
 
 test("AT-31: the run tab returns the Core's authoritative cursor for a post-drop refetch", async () => {

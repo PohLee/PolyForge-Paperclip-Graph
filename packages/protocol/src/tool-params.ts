@@ -79,9 +79,9 @@ export const TOOL_PARAMETERS = {
             size: { type: "number" },
             source: {
               type: "object",
-              description: "Where the bytes live.",
+              description: "Use an issue-scoped document ref (`issue:<issueId>/<documentKey>`) or inline bytes. Attachments are not enabled by this plugin.",
               properties: {
-                kind: { type: "string", enum: ["attachment", "document", "inline"] },
+                kind: { type: "string", enum: ["document", "inline"] },
                 ref: { type: "string" },
                 body: { type: "string" },
               },

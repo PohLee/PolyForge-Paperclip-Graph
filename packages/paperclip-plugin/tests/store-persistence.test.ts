@@ -141,3 +141,71 @@ test("a store written by one worker is found by the next", async () => {
   );
   second.close();
 });
+
+test("AT-26: an expired sent delivery survives SQLite restart as ambiguous and is not reclaimed", async () => {
+  const { BridgeStore } = await load<typeof import("../src/store.ts")>(new URL("../src/store.ts", import.meta.url));
+  const { mkdtempSync, rmSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const tempDir = mkdtempSync(join(tmpdir(), "pf-outbox-restart-"));
+  const path = join(tempDir, "bridge.sqlite");
+  let nowMs = 1_700_000_000_123;
+  let store = BridgeStore.open({ path, now: () => new Date(nowMs) });
+
+  try {
+    store.enqueueDelivery({
+      id: "delivery-restart-ambiguous",
+      companyId: "company-a",
+      projectId: "project-a",
+      kind: "event.intake",
+      effectKey: "effect:restart-ambiguous",
+      correlationId: "restart-ambiguous",
+      payload: { eventId: "event-1" },
+    });
+    const [claimed] = store.claimDueDeliveries({
+      companyId: "company-a",
+      owner: "worker-before-restart",
+      limit: 1,
+      leaseMs: 10_000,
+    });
+    assert.equal(claimed?.status, "sent");
+    assert.equal(claimed?.leaseExpiresAt, new Date(nowMs + 10_000).toISOString());
+    store.close();
+
+    // Reopening just before expiry must not lose precision and steal the still-live lease.
+    nowMs += 9_999;
+    store = BridgeStore.open({ path, now: () => new Date(nowMs) });
+    assert.deepEqual(
+      store.claimDueDeliveries({
+        companyId: "company-a",
+        owner: "worker-after-restart",
+        limit: 1,
+        leaseMs: 10_000,
+      }),
+      [],
+      "a millisecond lease is still active one millisecond before its expiry",
+    );
+    let row = store.getDeliveryByEffectKey("company-a", "effect:restart-ambiguous");
+    assert.equal(row?.status, "sent");
+    assert.equal(row?.leaseOwner, "worker-before-restart");
+
+    // Once expired, the write's outcome is unknown. It is moved to reconciliation, not sent again.
+    nowMs += 1;
+    assert.deepEqual(
+      store.claimDueDeliveries({
+        companyId: "company-a",
+        owner: "worker-after-restart",
+        limit: 1,
+        leaseMs: 10_000,
+      }),
+      [],
+    );
+    row = store.getDeliveryByEffectKey("company-a", "effect:restart-ambiguous");
+    assert.equal(row?.status, "ambiguous");
+    assert.equal(row?.leaseOwner, null);
+    assert.match(row?.lastError ?? "", /outcome was unknown/);
+  } finally {
+    store.close();
+    rmSync(tempDir, { recursive: true, force: true });
+  }
+});

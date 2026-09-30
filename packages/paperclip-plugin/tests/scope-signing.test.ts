@@ -20,11 +20,11 @@ import { load } from "./helpers/bootstrap.ts";
 
 const h = await load<typeof import("./helpers/harness.ts")>(new URL("./helpers/harness.ts", import.meta.url));
 
-const bridges: { dispose(): void }[] = [];
-after(() => {
+const bridges: { dispose(): Promise<void> }[] = [];
+after(async () => {
   for (const bridge of bridges) {
     try {
-      bridge.dispose();
+      await bridge.dispose();
     } catch {
       // A bridge that already tore itself down is not a failure worth reporting.
     }
@@ -35,7 +35,7 @@ function track<T extends { dispose(): void }>(bridge: T): T {
   return bridge;
 }
 
-const { COMPANY_A, PROJECT_A, company, project, issue } = h;
+const { COMPANY_A, COMPANY_B, PROJECT_A, PROJECT_B, company, project, issue } = h;
 
 function decodeScope(headers: Record<string, string>): { companyRef: string; projectRef: string } {
   const raw = headers["x-pf-scope"] ?? "";
@@ -47,9 +47,9 @@ async function bridgeWithRun() {
   const bridge = track(
     await h.buildBridge({
       seed: {
-        companies: [company(COMPANY_A)],
-        projects: [project(PROJECT_A, COMPANY_A)],
-        issues: [issue("root-1", COMPANY_A, PROJECT_A)],
+        companies: [company(COMPANY_A), company(COMPANY_B)],
+        projects: [project(PROJECT_A, COMPANY_A), project(PROJECT_B, COMPANY_B)],
+        issues: [issue("root-1", COMPANY_A, PROJECT_A), issue("root-b", COMPANY_B, PROJECT_B)],
       },
       configureRuntime: (runtime) => {
         runtime.seedRun("run-1", {
@@ -121,5 +121,18 @@ test("a run with no recorded project is refused rather than signed with a guess"
     bridge.runtime.requestsTo("GET", "/current").length,
     0,
     "nothing may reach the Core without a scope to sign it with",
+  );
+});
+
+test("another company's run is refused as out of scope and counted", async () => {
+  const bridge = await bridgeWithRun();
+  const before = bridge.counters()["crossScopeDenials"] as number;
+  const wiring = await load<typeof import("../src/worker.ts")>(new URL("../src/worker.ts", import.meta.url));
+  const toolRuntime = wiring.__testing.toolRuntimeFor(bridge.company);
+
+  await assert.rejects(() => toolRuntime.current(COMPANY_B, "run-1"));
+  assert.ok(
+    (bridge.counters()["crossScopeDenials"] as number) > before,
+    "a refusal that is never counted is a refusal nobody can measure",
   );
 });

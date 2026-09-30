@@ -52,7 +52,7 @@ def work_order(start_intent: str, **overrides) -> dict:
         "rootIssueRef": {"provider": "paperclip", "kind": "issue", "id": "issue-1"},
         "inputSnapshot": {"requirement_baseline": {"id": "rb-1"}},
         "requiredFacts": {
-            "requirement_gate_passed": {
+            "requirement_acceptance": {
                 "source": "imp-1",
                 "sourceRevision": "rev-7",
                 "contentHash": "sha256:" + "ab" * 32,
@@ -295,18 +295,20 @@ class DocumentedStatusTests(RuntimeApiCase):
             )[0],
             200,
         )
-        self.assertEqual(
-            self.client.call(
-                "POST",
-                f"/v1/runs/{run_id}/current",
-                {"adopt": False, "nodeId": "architecture"},
-                actor=agent_actor("agent-architect"),
-            )[0],
-            200,
-        )
+        self.assertEqual(self.client.call("POST", f"/v1/runs/{run_id}/current", {})[0], 405)
 
-    def test_a_takeover_without_the_platforms_confirmation_is_refused(self) -> None:
-        """AT-28: a replacement worker is admissible only once the old one is stopped."""
+    def test_get_current_cannot_be_used_to_take_over_a_worker(self) -> None:
+        run_id = self._run()
+        status, body, _ = self.client.call(
+            "GET",
+            f"/v1/runs/{run_id}/current?adopt=true&priorWorkerState=stopped",
+            actor=agent_actor("agent-architect"),
+        )
+        self.assertError(status, body, ErrorCode.BAD_REQUEST.value)
+        self.assertEqual(len(self.client.call("GET", f"/v1/runs/{run_id}")[1]["attempts"]), 0)
+
+    def test_a_replacement_claim_without_bridge_stop_observation_is_refused(self) -> None:
+        """AT-28: lease expiry alone cannot transfer ownership."""
         run_id = self._run()
         self.client.call(
             "POST",
@@ -319,15 +321,20 @@ class DocumentedStatusTests(RuntimeApiCase):
             },
         )
         status, body, _ = self.client.call(
-            "POST",
-            f"/v1/runs/{run_id}/current",
-            {"adopt": True, "nodeId": "architecture"},
+            "POST", f"/v1/runs/{run_id}/claims",
+            {
+                "commandId": ids.new_id("command"),
+                "nodeId": "architecture",
+                "iteration": 0,
+                "agentSubject": "agent-architect-2",
+                "leaseEpoch": 2,
+            },
             actor=agent_actor("agent-architect-2"),
         )
         self.assertIn(status, (409, 423), msg=body)
         self.assertEqual(len(self.client.call("GET", f"/v1/runs/{run_id}")[1]["attempts"]), 1)
 
-    def test_a_takeover_after_a_confirmed_stop_bumps_the_lease_epoch(self) -> None:
+    def test_a_bridge_confirmed_stop_allows_the_replacement_agent_to_claim(self) -> None:
         run_id = self._run()
         self.client.call(
             "POST",
@@ -341,20 +348,20 @@ class DocumentedStatusTests(RuntimeApiCase):
         )
         status, view, _ = self.client.call(
             "POST",
-            f"/v1/runs/{run_id}/current",
+            f"/v1/runs/{run_id}/claims",
             {
-                "adopt": True,
+                "commandId": ids.new_id("command"),
                 "nodeId": "architecture",
+                "iteration": 0,
+                "agentSubject": "agent-architect-2",
                 "priorWorkerState": "stopped",
-                # The Core refuses a takeover that does not present the next epoch, so the
-                # replacement has to say which epoch it is claiming.
                 "leaseEpoch": 2,
             },
             actor=agent_actor("agent-architect-2"),
         )
         self.assertEqual(status, 200, msg=view)
-        self.assertEqual(int(view["attempt"]["leaseEpoch"]), 2)
-        self.assertEqual(view["attempt"]["agentSubject"], "agent-architect-2")
+        self.assertEqual(int(view["leaseEpoch"]), 2)
+        self.assertEqual(view["agentSubject"], "agent-architect-2")
 
     def test_claim_and_submissions_answer_their_documented_status(self) -> None:
         run_id = self._run()
@@ -720,8 +727,14 @@ class DocumentedStatusTests(RuntimeApiCase):
         run_id = self._run()
         status, body, _ = self.client.call(
             "POST",
-            f"/v1/runs/{run_id}/current",
-            {"adopt": True, "leaseEpoch": "2"},
+            f"/v1/runs/{run_id}/claims",
+            {
+                "commandId": ids.new_id("command"),
+                "nodeId": "architecture",
+                "iteration": 0,
+                "agentSubject": "agent-architect",
+                "leaseEpoch": "2",
+            },
             actor=agent_actor("agent-architect"),
         )
         self.assertError(status, body, ErrorCode.BAD_REQUEST.value)

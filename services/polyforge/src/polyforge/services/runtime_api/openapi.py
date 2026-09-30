@@ -389,6 +389,11 @@ SCHEMAS: Final[dict[str, dict[str, Any]]] = {
             "rootIssueRef": _ref("ProviderRef"),
             "inputSnapshot": _any("Facts this run is admitted with."),
             "requiredFacts": _any("External prerequisites, each with verifiable provenance."),
+            "requiredFactSources": _any(
+                "Map each required fact to a sourceRunId. The Core only accepts a completed, "
+                "same-project GraphRun whose pinned plan exports the fact from exactly one "
+                "currently-passed Gate; provenance hashes are derived by Core."
+            ),
             "policyRules": _arr(
                 _any("The governed rules this run is pinned to. Naming a policy grants nothing.")
             ),
@@ -405,15 +410,17 @@ SCHEMAS: Final[dict[str, dict[str, Any]]] = {
             "runId": _str("Must match the path."),
             "nodeId": _str(),
             "iteration": _int(),
-            "attemptId": _str("Optional; the Core allocates one when absent."),
-            "leaseEpoch": _int("Presented for a takeover. A stale value is 409 LEASE_FENCED."),
+            "leaseEpoch": _int(
+                "The exact next epoch expected from Core; a stale, skipped, or malformed value is refused."
+            ),
             "agentSubject": _str("The qualified subject. It must hold the node's capabilities."),
             "agentRunRef": _ref("ProviderRef"),
             "issueRef": _ref("ProviderRef"),
             "contractHash": _str("Optional fence."),
             "priorWorkerState": _str(
-                "What the platform confirmed about a previous worker. A replacement attempt is "
-                "only admissible once the old one is stopped or fenced."
+                "Bridge-derived host observation, included only after the configured work adapter "
+                "confirms the prior agent run is stopped or terminal. Tool parameters cannot set "
+                "this field; unknown stop state must not be converted to stopped."
             ),
         },
         required=("nodeId", "iteration", "agentSubject"),
@@ -588,20 +595,6 @@ SCHEMAS: Final[dict[str, dict[str, Any]]] = {
             ),
         },
         required=("runId", "nodeId", "status", "permittedActions"),
-    ),
-    "AdoptRequest": _obj(
-        {
-            "adopt": _bool("Defaults to true on this route."),
-            "nodeId": _str("Node to take over; defaults to the current one."),
-            "priorWorkerState": _str(
-                "What the platform confirmed about the previous worker. A replacement attempt is "
-                "only admissible once the old one is stopped or fenced at the provider, and the "
-                "Core refuses a takeover without it."
-            ),
-            "leaseEpoch": _int("Presented for a takeover. A stale value is 409 LEASE_FENCED."),
-            "agentRunRef": _ref("ProviderRef"),
-            "commandId": _str("Allocated for the takeover when absent."),
-        }
     ),
     "RefusalList": _obj(
         {

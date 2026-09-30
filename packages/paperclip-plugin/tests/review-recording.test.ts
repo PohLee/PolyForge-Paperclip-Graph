@@ -22,10 +22,18 @@ const protocol = await load<typeof import("@polyforge/protocol")>("@polyforge/pr
 
 const { COMPANY_A, PROJECT_A } = h;
 
-const BOARD_USER = { type: "user" as const, userId: "user-anna", companyId: COMPANY_A, agentId: null, runId: null };
-const AGENT = { type: "agent" as const, agentId: "agent-1", agentId_: undefined, runId: "run-1" };
+const BOARD_USER = { type: "user" as const, userId: "user-anna" };
 
-test("the review action is declared in the shared contract", () => {
+async function actionFor(bridge: Awaited<ReturnType<typeof h.buildBridge>>) {
+  const { registerActionKeys } = await load<typeof import("../src/bridge/actions.ts")>(
+    new URL("../src/bridge/actions.ts", import.meta.url),
+  );
+  const handlers = new Map<string, (params: Record<string, unknown>, context: never) => Promise<unknown>>();
+  registerActionKeys((key, handler) => handlers.set(key, handler as never), (id) => bridge.companies.get(id) ?? null);
+  return handlers.get("record-draft-review")!;
+}
+
+test("the review action is declared and human-only", () => {
   assert.ok(
     protocol.ACTION_KEYS.includes("record-draft-review"),
     "the action must exist in the shared contract, or the UI cannot call it by name",
@@ -42,34 +50,14 @@ test("recording a review reaches the Core, with the reviewer as the asserted act
     },
   });
   try {
-    const { registerActionKeys } = await load<typeof import("../src/bridge/actions.ts")>(
-      new URL("../src/bridge/actions.ts", import.meta.url),
-    );
-    const actions = new Map<string, (params: Record<string, unknown>, context: never) => Promise<unknown>>();
-    registerActionKeys(
-      (key, handler) => actions.set(key, handler as never),
-      (id) => bridge.companies.get(id) ?? (id === COMPANY_A ? bridge.company : null),
-    );
-    // The host's action context: which company the host says this call is for, and the actor the
-    // host authenticated. Both come from the host in production, which is the whole point — the
-    // bridge never decides who the caller is.
-    const perform = async (params: Record<string, unknown>, actor: Record<string, unknown>) => {
-      const handler = actions.get("record-draft-review");
-      assert.ok(handler, "the action should be registered");
-      const context = { companyId: COMPANY_A, actor, requestId: "req-1", projectId: PROJECT_A };
-      try {
-        const value = await handler(params, context as never);
-        return { error: undefined as string | undefined, value };
-      } catch (error) {
-        return { error: error instanceof Error ? error.message : String(error), value: null };
-      }
-    };
+    const recordReview = await actionFor(bridge);
 
-    const result = await perform(
-      { companyId: COMPANY_A, projectId: PROJECT_A, draftId: "drf-1", reviewTargetHash: "sha256:plan" },
-      BOARD_USER,
-    );
-    assert.equal(result.error, undefined, JSON.stringify(result));
+    await recordReview({
+      companyId: COMPANY_A,
+      projectId: PROJECT_A,
+      draftId: "drf-1",
+      reviewTargetHash: "sha256:plan",
+    }, { actor: BOARD_USER, companyId: COMPANY_A } as never);
 
     const posted = bridge.runtime.requestsTo("POST", "/reviews").at(-1);
     assert.ok(posted, "the Core should have received a review");
@@ -87,7 +75,7 @@ test("recording a review reaches the Core, with the reviewer as the asserted act
     );
     assert.equal(JSON.parse(posted.bodyText ?? "{}")["reviewTargetHash"], "sha256:plan");
   } finally {
-    bridge.dispose();
+    await bridge.dispose();
   }
 });
 
@@ -100,38 +88,21 @@ test("an agent cannot record a review", async () => {
     },
   });
   try {
-    const { registerActionKeys } = await load<typeof import("../src/bridge/actions.ts")>(
-      new URL("../src/bridge/actions.ts", import.meta.url),
-    );
-    const actions = new Map<string, (params: Record<string, unknown>, context: never) => Promise<unknown>>();
-    registerActionKeys(
-      (key, handler) => actions.set(key, handler as never),
-      (id) => bridge.companies.get(id) ?? null,
-    );
-    const perform = async (params: Record<string, unknown>, actor: unknown) => {
-      const handler = actions.get("record-draft-review");
-      assert.ok(handler, "the action should be registered");
-      try {
-        const value = await handler(params, actor as never);
-        return { error: undefined, value };
-      } catch (error) {
-        return { error: error instanceof Error ? error.message : String(error), value: null };
-      }
-    };
+    const recordReview = await actionFor(bridge);
 
-    const result = await perform(
-      { companyId: COMPANY_A, projectId: PROJECT_A, draftId: "drf-1", reviewTargetHash: "sha256:plan" },
-      { type: "agent", agentId: "agent-1", runId: "run-1" },
-    );
-
-    assert.notEqual(result.error, undefined, "an agent's review must be refused");
+    await assert.rejects(() => recordReview({
+      companyId: COMPANY_A,
+      projectId: PROJECT_A,
+      draftId: "drf-1",
+      reviewTargetHash: "sha256:plan",
+    }, { actor: { type: "agent", agentId: "agent-1", runId: "run-1" }, companyId: COMPANY_A } as never));
     assert.equal(
       bridge.runtime.requestsTo("POST", "/reviews").length,
       0,
       "nothing may reach the Core once the bridge has refused",
     );
   } finally {
-    bridge.dispose();
+    await bridge.dispose();
   }
 });
 
@@ -144,33 +115,15 @@ test("a review with no target hash is refused", async () => {
     },
   });
   try {
-    const { registerActionKeys } = await load<typeof import("../src/bridge/actions.ts")>(
-      new URL("../src/bridge/actions.ts", import.meta.url),
-    );
-    const actions = new Map<string, (params: Record<string, unknown>, context: never) => Promise<unknown>>();
-    registerActionKeys(
-      (key, handler) => actions.set(key, handler as never),
-      (id) => bridge.companies.get(id) ?? null,
-    );
-    const perform = async (params: Record<string, unknown>, actor: unknown) => {
-      const handler = actions.get("record-draft-review");
-      assert.ok(handler, "the action should be registered");
-      try {
-        const value = await handler(params, actor as never);
-        return { error: undefined, value };
-      } catch (error) {
-        return { error: error instanceof Error ? error.message : String(error), value: null };
-      }
-    };
+    const recordReview = await actionFor(bridge);
 
-    const result = await perform(
-      { companyId: COMPANY_A, projectId: PROJECT_A, draftId: "drf-1" },
-      BOARD_USER,
-    );
-
-    assert.notEqual(result.error, undefined, "a review of nothing in particular is not a review");
+    await assert.rejects(() => recordReview({
+      companyId: COMPANY_A,
+      projectId: PROJECT_A,
+      draftId: "drf-1",
+    }, { actor: BOARD_USER, companyId: COMPANY_A } as never));
     assert.equal(bridge.runtime.requestsTo("POST", "/reviews").length, 0);
   } finally {
-    bridge.dispose();
+    await bridge.dispose();
   }
 });

@@ -528,17 +528,24 @@ async function graphVersions(company: CompanyContext, params: Record<string, unk
 // ---------------------------------------------------------------------------
 
 async function runtimeRuns(company: CompanyContext, params: Record<string, unknown>): Promise<RunListItem[]> {
-  const { runtime, store } = company;
+  const { runtime, store, ctx } = company;
   if (runtime === null) return [];
-  // The run list is a project view, so the project comes from the caller of the surface rather than
-  // being left empty for the Core to interpret.
-  const projectId = readProjectId(params, "runtime-runs");
-  const response = await runtime.listRuns(readActor(), { companyRef: company.companyId, projectRef: projectId }, {
-    ...(stringParam(params, "graphId") === null ? {} : { graphId: stringParam(params, "graphId") as string }),
-    ...(stringParam(params, "status") === null ? {} : { status: stringParam(params, "status") as string }),
-    limit: numberParam(params, "limit", 50),
-  });
-  const snapshots = Array.isArray(response.runs) ? response.runs : [];
+  // Runtime requires a company/project pair. The company-level Runs page has no selected project,
+  // so enumerate projects from Paperclip and issue one explicitly scoped read per project.
+  const projects = await ctx.projects.list({ companyId: company.companyId });
+  const limit = numberParam(params, "limit", 50);
+  const responses = await Promise.all(projects.map((project) => runtime.listRuns(
+    readActor(),
+    { companyRef: company.companyId, projectRef: project.id },
+    {
+      ...(stringParam(params, "graphId") === null ? {} : { graphId: stringParam(params, "graphId") as string }),
+      ...(stringParam(params, "status") === null ? {} : { status: stringParam(params, "status") as string }),
+      limit,
+    },
+  )));
+  const snapshots = responses.flatMap((response) => Array.isArray(response.runs) ? response.runs : [])
+    .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))
+    .slice(0, limit);
   const items: RunListItem[] = [];
   for (const snapshot of snapshots) {
     const binding = store.getBinding(company.companyId, RUN_BINDING_KIND, snapshot.runId);

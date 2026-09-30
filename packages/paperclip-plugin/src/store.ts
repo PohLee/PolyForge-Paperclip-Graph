@@ -894,31 +894,38 @@ export class BridgeStore {
     kinds?: string[];
   }): DeliveryRow[] {
     const nowMs = this.#now().getTime();
+    const nowIso = new Date(nowMs).toISOString();
     return this.transaction(() => {
       this.#prep(
-        `UPDATE delivery_operations SET lease_owner = NULL, lease_expires_at = NULL
-         WHERE company_id = ? AND lease_owner IS NOT NULL AND lease_expires_at IS NOT NULL
-           AND CAST(strftime('%s', lease_expires_at) AS INTEGER) * 1000 < ?`,
-      ).run(input.companyId, nowMs);
-      const nowIso = new Date(nowMs).toISOString();
-      // A live lease makes a row unclaimable, whoever holds it. `sent` rows are claimable so a
-      // crash between "sent" and "observed" recovers, but only once the lease has lapsed —
-      // without that, a second concurrent pass would re-claim a row that is still in flight and
-      // send the same effect twice, which is the one thing an outbox must never do.
-      const claimable = `(lease_owner IS NULL OR lease_expires_at IS NULL
-        OR CAST(strftime('%s', lease_expires_at) AS INTEGER) * 1000 < ${nowMs})`;
+        `UPDATE delivery_operations SET status = 'ambiguous', lease_owner = NULL, lease_expires_at = NULL,
+           last_error = 'worker lease expired while delivery outcome was unknown', updated_at = ?
+         WHERE company_id = ? AND status = 'sent'
+           AND (lease_owner IS NULL OR lease_expires_at IS NULL OR lease_expires_at <= ?)`,
+      ).run(nowIso, input.companyId, nowIso);
+      // A sent row means an external request may already have taken effect. Once its lease expires,
+      // it must go through reconciliation, never back through the sender. Only pending rows are
+      // eligible for dispatch; re-running an expired sent row is a blind duplicate effect.
+      this.#prep(
+        `UPDATE delivery_operations SET lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
+         WHERE company_id = ? AND status = 'pending' AND lease_owner IS NOT NULL
+           AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?`,
+      ).run(nowIso, input.companyId, nowIso);
+      // Stored lease timestamps are canonical millisecond ISO strings, so lexical comparison
+      // preserves their full precision. SQLite strftime('%s') truncates to seconds and expires
+      // some millisecond leases early.
+      const claimable = `(lease_owner IS NULL OR lease_expires_at IS NULL OR lease_expires_at <= ?)`;
       const rows = input.kinds
         ? this.#prep(
             `SELECT * FROM delivery_operations
-             WHERE company_id = ? AND status IN ('pending', 'sent') AND next_attempt_at <= ? AND ${claimable}
+             WHERE company_id = ? AND status = 'pending' AND next_attempt_at <= ? AND ${claimable}
                AND kind IN (${input.kinds.map(() => "?").join(",")})
              ORDER BY next_attempt_at ASC LIMIT ?`,
-          ).all(input.companyId, nowIso, ...input.kinds, input.limit)
+          ).all(input.companyId, nowIso, nowIso, ...input.kinds, input.limit)
         : this.#prep(
             `SELECT * FROM delivery_operations
-             WHERE company_id = ? AND status IN ('pending', 'sent') AND next_attempt_at <= ? AND ${claimable}
+             WHERE company_id = ? AND status = 'pending' AND next_attempt_at <= ? AND ${claimable}
              ORDER BY next_attempt_at ASC LIMIT ?`,
-          ).all(input.companyId, nowIso, input.limit);
+          ).all(input.companyId, nowIso, nowIso, input.limit);
       const claimed: DeliveryRow[] = [];
       for (const row of rows) {
         const delivery = mapDelivery(row);
@@ -926,7 +933,15 @@ export class BridgeStore {
         const result = this.#prep(
           `UPDATE delivery_operations SET lease_owner = ?, lease_expires_at = ?, status = 'sent', updated_at = ?
            WHERE company_id = ? AND effect_key = ? AND status = ? AND ${claimable}`,
-        ).run(input.owner, leaseExpiresAt, new Date(nowMs).toISOString(), input.companyId, delivery.effectKey, delivery.status);
+        ).run(
+          input.owner,
+          leaseExpiresAt,
+          nowIso,
+          input.companyId,
+          delivery.effectKey,
+          delivery.status,
+          nowIso,
+        );
         if (result.changes > 0) claimed.push({ ...delivery, status: "sent", leaseOwner: input.owner, leaseExpiresAt });
       }
       return claimed;

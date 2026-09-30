@@ -164,7 +164,10 @@ Exit gate：编辑→验证→编译→diff/review→发布→新 run 固定版�
 
 ## 10. 验收测试矩阵
 
-状态：以下均为**待实施/待执行测试**，本文未运行实际 Paperclip integration suite。
+状态：以下是完整验收基准，不等同于已执行或通过。当前 checkout 的 harness/单元覆盖、真实 Paperclip host 验收和未覆盖项按
+[`07-VERIFICATION-STATUS.md`](07-VERIFICATION-STATUS.md) 记录；本地测试通过不能替代真实 host integration、故障演练或 UAT。当前 checkout 最近一轮完整 `npm.cmd run verify` 运行了 253 项 plugin tests 与 947 项 Core/Runtime tests（含缺失证据拒绝、同一 SQLite 文件上重建 Runtime API service 后恢复 human wait 的 loopback HTTP E2E），但这不代表 AT-01–35 全部通过；完整的分项和边界见验证状态记录。
+
+追溯规则：只有测试标题明确标注的 AT 编号才映射到下表；Python 方法名以 `AT_XX` 表示标题中的 `AT-XX`，文件名和类 docstring 本身不是验收编号。工具 claim/fencing 与 outbox suite 已按行为重命名，避免和本表的 AT-06（workspace isolation）及 AT-09（evidence immutability）混淆；outbox 内只有明确标注的测试映射到 AT-26。当前 AT-06 的局部负向证据拒绝 shared/missing workspace 和错误 commit；matching isolated workspace 只在本地 harness 放行。虽然代码要求匹配 repo/ref/commit 的 host 元数据，仍不代表并发隔离、固定 commit reviewer 或真实 host 隔离验收通过。
 
 | ID | 对应需求 | 测试与验收结果要求 |
 |---|---|---|

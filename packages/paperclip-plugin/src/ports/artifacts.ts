@@ -5,12 +5,14 @@
  * source can try to make the bridge fetch from inside the network, read a local file, or point
  * at a mutable URL that changes meaning later. Three rules follow.
  *
- * * **No URL is ever a source, and a mutable URL is never an identity.** The only sources are
- *   an issue attachment id, an issue document key, or an inline body — all resolved *through
- *   the company-scoped host client*, never dereferenced. A `source.ref` that looks like a URL,
+ * * **No URL is ever a source, and a mutable URL is never an identity.** The enabled sources are
+ *   an issue document key or an inline body — resolved *through the company-scoped host client*,
+ *   never dereferenced. Attachment reads are explicitly refused because the manifest does not
+ *   request `issue.attachments.read`. A `source.ref` that looks like a URL,
  *   a UNC path, or that contains `..` is refused as a hostile source before any read. An
  *   identity is always `(issue, kind, contentHash)`, so a document whose body changes produces
- *   a *new* artifact rather than mutating the old one (REQ-DATA-02, AT-09).
+ *   a *new* artifact rather than mutating the old one (REQ-DATA-02, AT-09). Mutable source
+ *   documents are copied to content-addressed artifact documents; provider refs never follow them.
  * * **The bytes are hashed by the bridge, and the declared digest must match.** A mismatch
  *   increments `artifactDigestMismatch` and refuses. The Core is never told a digest the
  *   bridge did not compute from bytes it read.
@@ -117,6 +119,14 @@ export class ArtifactPortImpl implements ArtifactPort {
       });
     }
 
+    if (req.source.kind === "attachment") {
+      deliveries.failed(deliveryKey, "attachment reads are not enabled by the plugin capability manifest");
+      throw new UnsupportedCapabilityError(
+        "issue.attachments.read",
+        "attachment evidence is not enabled; use a company-scoped issue document or inline artifact",
+      );
+    }
+
     const resolved = await this.#resolveBytes(req);
     const actualHash = digestBytes(resolved.bytes);
     if (actualHash !== req.contentHash) {
@@ -159,7 +169,9 @@ export class ArtifactPortImpl implements ArtifactPort {
       return {
         providerRef: ref,
         contentHash: String(record["contentHash"] ?? actualHash),
-        source: { kind: req.source.kind, ref: req.source.ref },
+        source: record["source"] && typeof record["source"] === "object"
+          ? (record["source"] as Record<string, unknown>)
+          : this.#sourceDescriptor(req.source, resolved),
       };
     }
 
@@ -179,6 +191,7 @@ export class ArtifactPortImpl implements ArtifactPort {
         providerId: stored.providerId,
         revision: stored.revision,
         immutable: stored.immutable,
+        source: this.#sourceDescriptor(req.source, resolved),
         repository: req.repository ?? null,
         publishedAt: this.#deps.now().toISOString(),
         commandId: meta.commandId,
@@ -203,6 +216,7 @@ export class ArtifactPortImpl implements ArtifactPort {
         providerId: stored.providerId,
         revision: stored.revision,
         immutable: stored.immutable,
+        source: this.#sourceDescriptor(req.source, resolved),
         repository: req.repository ?? null,
         identityKey: key,
         publishedAt: this.#deps.now().toISOString(),
@@ -223,14 +237,31 @@ export class ArtifactPortImpl implements ArtifactPort {
     return {
       providerRef: providerRef(stored.refKind, stored.providerId, stored.revision),
       contentHash: actualHash,
-      source: { kind: req.source.kind, ref: req.source.ref },
+      source: this.#sourceDescriptor(req.source, resolved),
+    };
+  }
+
+  #sourceDescriptor(
+    source: { kind: string; ref?: string },
+    resolved: { bytes: Uint8Array; origin: string },
+  ): Record<string, unknown> {
+    return {
+      kind: source.kind,
+      ...(source.ref === undefined ? {} : { ref: source.ref }),
+      ...(source.kind === "document" && resolved.origin.startsWith("document:")
+        ? { revision: resolved.origin.slice("document:".length) }
+        : {}),
     };
   }
 
   #resolveIssueId(req: ArtifactUpload, scope: Scope): string {
     const ref = req.source.ref;
+    if (req.source.kind === "document" && ref !== undefined) {
+      return this.#issueIdFromDocumentRef(ref);
+    }
     if (ref !== undefined && ref.length > 0 && ref.startsWith("issue:")) {
-      return ref.slice("issue:".length);
+      const issueId = ref.slice("issue:".length);
+      if (!issueId.includes("/")) return issueId;
     }
     const recorded = this.#deps.store.listBindings(scope.companyRef, "work_unit", 1000);
     void recorded;
@@ -269,16 +300,14 @@ export class ArtifactPortImpl implements ArtifactPort {
       const issueId = this.#issueIdFromDocumentRef(key);
       assertSafeSourceRef(issueId, "document issue id");
       assertSafeSourceRef(key.slice(`issue:${issueId}/`.length), "document key");
-      const doc = await ctx.issues.documents.get(issueId, key, companyId);
+      const documentKey = key.slice(`issue:${issueId}/`.length);
+      const doc = await ctx.issues.documents.get(issueId, documentKey, companyId);
       if (!doc) {
         throw new BridgeError("BRIDGE_INTEGRITY_FAILURE", "BLOCKED_SCOPE", "document is not readable in this company", {
           key,
         });
       }
-      return {
-        bytes: new TextEncoder().encode(doc.body),
-        origin: `document:${doc.latestRevisionId}`,
-      };
+      return { bytes: new TextEncoder().encode(doc.body), origin: `document:${doc.latestRevisionId}` };
     }
     if (req.source.kind === "inline") {
       const body = req.source.body ?? "";
@@ -306,10 +335,9 @@ export class ArtifactPortImpl implements ArtifactPort {
   /**
    * Persist the bytes somewhere the host can serve back.
    *
-   * An inline body and a document body have no host object of their own, so the bridge stores
-   * them as an issue document under a key derived from the *content hash*. Two uploads of the
-   * same bytes therefore land on the same document key, which is what makes
-   * `create-or-verify by content hash` true for them as well.
+   * Inline bodies and mutable source documents are snapshotted under a key derived from the full
+   * content hash. Two uploads of the same bytes land on the same document key, while an updated
+   * source document gets a new key and cannot rewrite old evidence.
    */
   async #storeBytes(
     req: ArtifactUpload,
@@ -326,11 +354,8 @@ export class ArtifactPortImpl implements ArtifactPort {
         immutable: true,
       };
     }
-    if (resolved.origin.startsWith("document:")) {
-      const revision = resolved.origin.slice("document:".length);
-      return { refKind: "issue_document_revision", providerId: req.source.ref ?? "", revision, immutable: true };
-    }
-    const documentKey = `polyforge/artifact-${req.kind}-${contentHash.slice(7, 19)}`;
+    const kindHash = digestBytes(new TextEncoder().encode(req.kind)).slice("sha256:".length);
+    const documentKey = `polyforge/artifact-${kindHash}-${contentHash.slice("sha256:".length)}`;
     const body = new TextDecoder().decode(resolved.bytes);
     const document = await ctx.issues.documents.upsert({
       issueId,
@@ -394,7 +419,7 @@ export class ArtifactPortImpl implements ArtifactPort {
         repository: (record["repository"] as { repoRef: string; commit: string } | null) ?? null,
       };
     }
-    const digestVerified = digestBytes(verification.bytes) === recordedHash;
+    const digestVerified = verification.revisionMatches && digestBytes(verification.bytes) === recordedHash;
     if (!digestVerified) metrics.bump(companyId, "artifactDigestMismatch");
     return {
       ref,
@@ -412,24 +437,30 @@ export class ArtifactPortImpl implements ArtifactPort {
     ref: ProviderRefLike,
     companyId: string,
     issueId: string,
-  ): Promise<{ bytes: Uint8Array } | null> {
+  ): Promise<{ bytes: Uint8Array; revisionMatches: boolean } | null> {
     const { ctx, config } = this.#deps;
     if (ref.kind === "issue_attachment") {
       const content = await ctx.issues.getAttachmentContent(ref.id, companyId, { maxBytes: config.maxArtifactBytes });
       if (!content) return null;
-      return { bytes: new Uint8Array(Buffer.from(content.contentBase64, "base64")) };
+      return { bytes: new Uint8Array(Buffer.from(content.contentBase64, "base64")), revisionMatches: true };
     }
     if (ref.kind === "issue_document_revision" || ref.kind === "issue_document") {
-      const documentId = ref.id;
-      const doc = await ctx.issues.documents.get(issueId, documentId, companyId);
+      let documentKey = ref.id;
+      if (ref.id.startsWith("issue:")) {
+        const refIssueId = this.#issueIdFromDocumentRef(ref.id);
+        if (refIssueId !== issueId) return null;
+        documentKey = ref.id.slice(`issue:${refIssueId}/`.length);
+      }
+      assertSafeSourceRef(documentKey, "document key");
+      const doc = await ctx.issues.documents.get(issueId, documentKey, companyId);
       if (!doc) return null;
       // A document key is mutable: the host only exposes the latest revision. That is exactly
       // why the recorded `revision` matters — a caller holding an older revision must treat
       // the artifact as stale rather than as the current body.
-      if (ref.revision !== undefined && doc.latestRevisionId !== ref.revision) {
-        return { bytes: new TextEncoder().encode(doc.body) };
-      }
-      return { bytes: new TextEncoder().encode(doc.body) };
+      return {
+        bytes: new TextEncoder().encode(doc.body),
+        revisionMatches: ref.revision !== undefined && doc.latestRevisionId === ref.revision,
+      };
     }
     return null;
   }

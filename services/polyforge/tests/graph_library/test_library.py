@@ -178,7 +178,7 @@ class ValidationTest(unittest.TestCase):
         definition = load_graph("design")
         start = definition["entrypoints"]["design.start"]
         self.assertEqual(start["inputs"], ["requirement_baseline"])
-        self.assertEqual(start["requiresFacts"], ["requirement_gate_passed"])
+        self.assertEqual(start["requiresFacts"], ["requirement_acceptance"])
         self.assertEqual(start["coordinator"]["requiredCapabilities"], ["design.coordinate"])
         self.assertEqual(start["coordinator"]["fallbackRoles"], ["tech_lead"])
         self.assertEqual(start["startNodes"], ["architecture"])
@@ -212,6 +212,21 @@ class ValidationTest(unittest.TestCase):
         join = definition["nodes"]["implementation_join"]["join"]
         self.assertEqual(join["semantics"], "all")
         self.assertEqual(sorted(join["inputs"]), ["backend_impl", "frontend_impl"])
+
+    def test_cross_family_prerequisite_facts_match_the_previous_gate_exports(self):
+        requirement = load_graph("requirement")
+        design = load_graph("design")
+        implementation = load_graph("implementation")
+        self.assertEqual(
+            design["entrypoints"]["design.start"]["requiresFacts"],
+            ["requirement_acceptance"],
+        )
+        self.assertIn("requirement_acceptance", requirement["entrypoints"]["requirement.start"]["exports"])
+        self.assertEqual(
+            implementation["entrypoints"]["implementation.start"]["requiresFacts"],
+            ["design_acceptance"],
+        )
+        self.assertIn("design_acceptance", design["entrypoints"]["design.start"]["exports"])
 
     def test_verification_runs_three_branches_in_parallel(self):
         definition = load_graph("verification")

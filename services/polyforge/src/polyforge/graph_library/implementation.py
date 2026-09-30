@@ -28,7 +28,7 @@ _DEFINITION: Final[dict[str, Any]] = {
         "implementation.start": {
             "key": "implementation.start",
             "inputs": ["design_acceptance"],
-            "requiresFacts": ["design_gate_passed"],
+            "requiresFacts": ["design_acceptance"],
             "coordinator": {
                 "requiredCapabilities": ["implementation.coordinate"],
                 "preferredRoles": ["tech_lead"],

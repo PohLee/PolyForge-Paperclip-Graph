@@ -19,10 +19,10 @@ const configModule = await load<typeof import("../src/config.ts")>(new URL("../s
 
 const { COMPANY_A, COMPANY_B, PROJECT_A, PROJECT_B, buildBridge, company, project, issue, label } = h;
 const bridges: { dispose(): void }[] = [];
-after(() => {
-  for (const bridge of bridges) bridge.dispose();
+after(async () => {
+  for (const bridge of bridges) await bridge.dispose();
 });
-function track<T extends { dispose(): void }>(bridge: T): T {
+function track<T extends { dispose(): Promise<void> }>(bridge: T): T {
   bridges.push(bridge);
   return bridge;
 }

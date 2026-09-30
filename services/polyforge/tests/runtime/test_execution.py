@@ -8,6 +8,7 @@ with every mandatory evaluator passing.
 from __future__ import annotations
 
 import copy
+import sqlite3
 import unittest
 
 from services.polyforge.tests.runtime.fixtures import (
@@ -321,9 +322,9 @@ class IdempotencyAndVersioningTests(EngineCase):
 class FencingTests(EngineCase):
     """AT-28: an expired lease with a live worker cannot produce a new effect."""
 
-    def test_a_stale_epoch_write_is_fenced_and_recorded_as_a_diagnostic(self) -> None:
+    def test_AT_28_a_stale_epoch_write_is_fenced_and_recorded_as_a_diagnostic(self) -> None:
         attempt = self.engine.claim(
-            claim_request(run_id=self.run_id, node_id=QA_NODE, subject="sub-qa", lease_epoch=4)
+            claim_request(run_id=self.run_id, node_id=QA_NODE, subject="sub-qa", lease_epoch=1)
         )
         with self.assertRaises(errors.PolyForgeError) as caught:
             self.engine.submit_artifacts(
@@ -331,13 +332,13 @@ class FencingTests(EngineCase):
                     run_id=self.run_id,
                     node_id=QA_NODE,
                     attempt_id=attempt["attemptId"],
-                    lease_epoch=3,
+                    lease_epoch=0,
                     payload={"artifacts": [artifact("qa_report", "late")]},
                 )
             )
         self.assertEqual(caught.exception.code, errors.ErrorCode.LEASE_FENCED)
-        self.assertEqual(caught.exception.details["presentedEpoch"], 3)
-        self.assertEqual(caught.exception.details["activeEpoch"], 4)
+        self.assertEqual(caught.exception.details["presentedEpoch"], 0)
+        self.assertEqual(caught.exception.details["activeEpoch"], 1)
         rejections = self.engine.refusals(self.run_id)
         self.assertEqual(len(rejections), 1)
         self.assertEqual(str(rejections[0]["code"]), "LEASE_FENCED")
@@ -361,7 +362,7 @@ class FencingTests(EngineCase):
             )
         self.assertEqual(caught.exception.code, errors.ErrorCode.LEASE_FENCED)
 
-    def test_two_owners_are_not_both_admitted(self) -> None:
+    def test_AT_28_two_owners_are_not_both_admitted(self) -> None:
         first = self.engine.claim(
             claim_request(run_id=self.run_id, node_id=QA_NODE, subject="sub-qa", lease_epoch=1)
         )
@@ -376,7 +377,7 @@ class FencingTests(EngineCase):
         )
         self.assertEqual([r["attempt_id"] for r in active], [first["attemptId"]])
 
-    def test_a_takeover_without_a_stop_confirmation_is_refused(self) -> None:
+    def test_AT_28_a_takeover_without_a_stop_confirmation_is_refused(self) -> None:
         self.clock.advance(1000)
         self.engine.claim(
             claim_request(run_id=self.run_id, node_id=QA_NODE, subject="sub-qa", lease_epoch=1)
@@ -390,7 +391,7 @@ class FencingTests(EngineCase):
         self.assertEqual(caught.exception.code, errors.ErrorCode.LEASE_FENCED)
         self.assertEqual(caught.exception.details["requiredPriorWorkerState"], ["fenced", "stopped"])
 
-    def test_a_takeover_with_a_stop_confirmation_fences_the_incumbent(self) -> None:
+    def test_AT_28_a_takeover_with_a_stop_confirmation_fences_the_incumbent(self) -> None:
         self.clock.advance(1000)
         first = self.engine.claim(
             claim_request(run_id=self.run_id, node_id=QA_NODE, subject="sub-qa", lease_epoch=1)
@@ -414,7 +415,7 @@ class FencingTests(EngineCase):
 
     def test_a_takeover_at_an_equal_epoch_is_refused(self) -> None:
         self.engine.claim(
-            claim_request(run_id=self.run_id, node_id=QA_NODE, subject="sub-qa", lease_epoch=5)
+            claim_request(run_id=self.run_id, node_id=QA_NODE, subject="sub-qa", lease_epoch=1)
         )
         with self.assertRaises(errors.PolyForgeError) as caught:
             self.engine.claim(
@@ -422,12 +423,29 @@ class FencingTests(EngineCase):
                     run_id=self.run_id,
                     node_id=QA_NODE,
                     subject="sub-other",
-                    lease_epoch=5,
+                    lease_epoch=1,
                     priorWorkerState="stopped",
                 )
             )
         self.assertEqual(caught.exception.code, errors.ErrorCode.LEASE_FENCED)
-        self.assertEqual(caught.exception.details["activeEpoch"], 5)
+        self.assertEqual(caught.exception.details["activeEpoch"], 1)
+
+    def test_a_takeover_cannot_skip_lease_epochs(self) -> None:
+        self.engine.claim(
+            claim_request(run_id=self.run_id, node_id=QA_NODE, subject="sub-qa", lease_epoch=1)
+        )
+        with self.assertRaises(errors.PolyForgeError) as caught:
+            self.engine.claim(
+                claim_request(
+                    run_id=self.run_id,
+                    node_id=QA_NODE,
+                    subject="sub-other",
+                    lease_epoch=3,
+                    priorWorkerState="stopped",
+                )
+            )
+        self.assertEqual(caught.exception.code, errors.ErrorCode.LEASE_FENCED)
+        self.assertEqual(caught.exception.details["requiredEpoch"], 2)
 
     def test_a_reclaim_by_the_same_owner_is_idempotent(self) -> None:
         first = self.engine.claim(
@@ -437,6 +455,21 @@ class FencingTests(EngineCase):
             claim_request(run_id=self.run_id, node_id=QA_NODE, subject="sub-qa", lease_epoch=1)
         )
         self.assertEqual(first["attemptId"], again["attemptId"])
+
+    def test_attempt_id_is_allocated_by_core_not_the_claimant(self) -> None:
+        with self.assertRaises(errors.PolyForgeError) as caught:
+            self.engine.claim(
+                claim_request(
+                    run_id=self.run_id,
+                    node_id=QA_NODE,
+                    subject="sub-qa",
+                    lease_epoch=1,
+                    attemptId="attempt-caller-chosen",
+                )
+            )
+        self.assertEqual(caught.exception.code, errors.ErrorCode.CONTRACT_INVALID)
+        attempts = self.db.query("SELECT * FROM execution_attempts WHERE run_id = ?", (self.run_id,))
+        self.assertEqual(attempts, [])
 
 
 class SessionHandoverTests(EngineCase):
@@ -499,7 +532,7 @@ class BudgetTests(EngineCase):
             }
         )
 
-    def test_a_hard_stop_blocks_a_claim_for_every_agent(self) -> None:
+    def test_AT_10_a_hard_stop_blocks_a_claim_for_every_agent(self) -> None:
         self._hard_stop()
         for subject in ("sub-qa", "sub-security", "sub-anyone"):
             with self.subTest(subject=subject):
@@ -512,7 +545,7 @@ class BudgetTests(EngineCase):
             len(self.db.query("SELECT * FROM execution_attempts WHERE run_id = ?", (self.run_id,))), 0
         )
 
-    def test_a_hard_stop_blocks_a_retry_command(self) -> None:
+    def test_AT_10_a_hard_stop_blocks_a_retry_command(self) -> None:
         self._hard_stop()
         with self.assertRaises(errors.PolyForgeError) as caught:
             self.engine.run_command(
@@ -528,7 +561,7 @@ class BudgetTests(EngineCase):
             )
         self.assertEqual(caught.exception.code, errors.ErrorCode.RUN_BLOCKED)
 
-    def test_a_hard_stop_cannot_be_cleared_by_resolve_block(self) -> None:
+    def test_AT_10_a_hard_stop_cannot_be_cleared_by_resolve_block(self) -> None:
         self._hard_stop()
         with self.assertRaises(errors.PolyForgeError) as caught:
             self.engine.run_command(
@@ -556,7 +589,7 @@ class BudgetTests(EngineCase):
         self.assertIn("BUDGET_HARD_STOP", [b["code"] for b in snapshot["blockers"]])
         self.assertEqual(snapshot["blockers"][0]["reason"], str(BlockReason.BUDGET))
 
-    def test_an_exhausted_rework_budget_blocks_rather_than_looping(self) -> None:
+    def test_AT_10_an_exhausted_rework_budget_blocks_rather_than_looping(self) -> None:
         # Two failures exhaust the fixture's maxAttempts of 2, and the third claim is refused.
         for _ in range(2):
             self.engine.run_command(
@@ -577,7 +610,7 @@ class BudgetTests(EngineCase):
         self.assertEqual(caught.exception.code, errors.ErrorCode.RUN_BLOCKED)
         self.assertIn("engineering rework budget", caught.exception.message)
 
-    def test_a_retry_above_the_ceiling_reports_an_explainable_block(self) -> None:
+    def test_AT_10_a_retry_above_the_ceiling_reports_an_explainable_block(self) -> None:
         for _ in range(3):
             result = self.engine.run_command(
                 {
@@ -618,12 +651,13 @@ class BudgetTests(EngineCase):
 
 
 class TraceabilityTests(EngineCase):
-    """AT-11: a transition traces back to the issue, agent run, evidence, gate, and effect."""
+    """AT-11 subset: trace a Core transition to its issue, agent run, evidence, and gate."""
 
-    def test_the_transition_is_traceable_end_to_end(self) -> None:
+    def test_AT_11_the_transition_is_traceable_to_its_issue_run_evidence_and_gate(self) -> None:
         outcome = self.work(QA_NODE, "sub-qa", "qa_report", "qa-v1")
         snapshot = self.engine.get_run(self.run_id, scope=SCOPE_A)
-        self.assertEqual(snapshot["nodes"][0]["nodeId"] or snapshot["nodes"][1]["nodeId"], snapshot["nodes"][0]["nodeId"] or "")
+        self.assertTrue(outcome["result"]["applied"])
+        self.assertTrue(any(node["nodeId"] == QA_NODE for node in snapshot["nodes"]))
         attempt = next(a for a in snapshot["attempts"] if a["nodeId"] == QA_NODE)
         self.assertEqual(attempt["agentSubject"], "sub-qa")
         self.assertEqual(attempt["agentRunRef"]["id"], "run-sub-qa")
@@ -642,6 +676,8 @@ class TraceabilityTests(EngineCase):
         self.assertEqual(len(bindings), 1)
         self.assertIsNotNone(bindings[0]["issue_ref_json"])
         self.assertEqual(str(bindings[0]["contract_hash"]), str(attempt["transitionHash"]))
+        self.assertEqual(outcome["attempt"]["attemptId"], attempt["attemptId"])
+        self.assertEqual(outcome["attempt"]["transitionHash"], attempt["transitionHash"])
 
     def test_every_event_carries_the_run_and_a_monotonic_sequence(self) -> None:
         self.work(QA_NODE, "sub-qa", "qa_report", "qa-v1")
@@ -658,17 +694,78 @@ class TraceabilityTests(EngineCase):
         self.assertTrue(all(str(r["evidence_set_hash"]).startswith("sha256:") for r in rows))
         self.assertTrue(all(str(r["mandatory"]) == "1" for r in rows))
 
+    def test_AT_11_a_transition_audit_write_failure_is_visible_and_rolls_back_pass(self) -> None:
+        attempt = self.engine.claim(
+            claim_request(run_id=self.run_id, node_id=QA_NODE, subject="sub-qa")
+        )
+        art = artifact("qa_report", "audit-failure")
+        self.engine.submit_artifacts(
+            envelope(
+                run_id=self.run_id,
+                node_id=QA_NODE,
+                attempt_id=attempt["attemptId"],
+                lease_epoch=attempt["leaseEpoch"],
+                payload={"artifacts": [art]},
+            )
+        )
+        evidence = self.engine.submit_evidence(
+            envelope(
+                run_id=self.run_id,
+                node_id=QA_NODE,
+                attempt_id=attempt["attemptId"],
+                lease_epoch=attempt["leaseEpoch"],
+                command_suffix="audit-failure-ev",
+                payload={"evidence": [evidence_for(art, "qa_report")]},
+            )
+        )
+        before = self.engine.get_run(self.run_id, scope=SCOPE_A)
+        before_node = self.node(QA_NODE)
+        before_sequence = int(
+            self.db.query_one("SELECT event_sequence FROM graph_runs WHERE run_id = ?", (self.run_id,))["event_sequence"]
+        )
+        execute = self.db.execute
+
+        def fail_transition_event(sql: str, params: object = ()) -> int:
+            if "INSERT INTO domain_events" in sql:
+                raise sqlite3.OperationalError("injected critical event/audit write failure")
+            return execute(sql, params)  # type: ignore[arg-type]
+
+        self.db.execute = fail_transition_event  # type: ignore[method-assign]
+        try:
+            with self.assertRaisesRegex(sqlite3.OperationalError, "critical event/audit write failure"):
+                self.engine.request_transition(
+                    envelope(
+                        run_id=self.run_id,
+                        node_id=QA_NODE,
+                        attempt_id=attempt["attemptId"],
+                        lease_epoch=attempt["leaseEpoch"],
+                        command_suffix="audit-failure-tr",
+                        payload={"evidenceIds": [str(evidence["resultRef"]).split(",")[0]]},
+                    )
+                )
+        finally:
+            self.db.execute = execute  # type: ignore[method-assign]
+
+        after = self.engine.get_run(self.run_id, scope=SCOPE_A)
+        self.assertEqual(self.node(QA_NODE)["status"], before_node["status"])
+        self.assertNotEqual(self.node(QA_NODE)["status"], NodeStatus.PASSED)
+        self.assertEqual(after["stateVersion"], before["stateVersion"])
+        self.assertEqual(
+            int(self.db.query_one("SELECT event_sequence FROM graph_runs WHERE run_id = ?", (self.run_id,))["event_sequence"]),
+            before_sequence,
+        )
+
 
 class JoinAndSequencingTests(EngineCase):
     """AT-05: only legal successors are released, and a parent needs verified child exports."""
 
-    def test_the_reviewer_is_not_released_before_qa_passes(self) -> None:
+    def test_AT_05_the_reviewer_is_not_released_before_qa_passes(self) -> None:
         self.assertEqual(self.node(REVIEW_NODE)["status"], NodeStatus.PENDING)
         self.work(QA_NODE, "sub-qa", "qa_report", "qa-v1")
         self.assertEqual(self.node(REVIEW_NODE)["status"], NodeStatus.READY)
         self.assertEqual(self.node(GATE_NODE)["status"], NodeStatus.PENDING)
 
-    def test_the_gate_needs_both_upstreams(self) -> None:
+    def test_AT_05_the_gate_needs_both_upstreams(self) -> None:
         self.work(QA_NODE, "sub-qa", "qa_report", "qa-v1")
         self.work(REVIEW_NODE, "sub-security", "security_review", "sec-v1")
         self.assertEqual(self.node(GATE_NODE)["status"], NodeStatus.READY)
@@ -799,6 +896,52 @@ class HumanDecisionTests(EngineCase):
         self.assertTrue(result["applied"])
         self.assertEqual(result["status"], NodeStatus.PASSED)
         self.assertEqual(self.engine.get_run(self.run_id, scope=SCOPE_A)["status"], GraphRunStatus.COMPLETED)
+
+    def test_AT_11_human_resolution_and_effect_intent_share_the_gate_transition(self) -> None:
+        attempt, _ = self._reach_the_gate()
+        pending = self.engine.get_run(self.run_id, scope=SCOPE_A)["pendingGovernance"][0]
+        resolution = self.engine.record_governance_resolution(
+            self.run_id,
+            pending["requestId"],
+            {
+                "scope": SCOPE_A,
+                "commandId": "cmd-at11-resolve",
+                "idempotencyKey": "at11-resolve",
+                "responderSubject": "user-anna",
+                "responderKind": "human",
+                "outcome": "accept",
+                "verifiedAgainstProvider": True,
+                "detail": {"decisionTargetHash": pending["decisionTargetHash"]},
+            },
+        )
+        self.assertTrue(resolution["applied"])
+        binding = self.db.query_one(
+            "SELECT * FROM governance_bindings WHERE run_id = ? AND request_id = ?",
+            (self.run_id, pending["requestId"]),
+        )
+        self.assertIsNotNone(binding)
+        assert binding is not None
+        self.assertEqual(str(binding["state"]), "RESOLVED")
+        self.assertEqual(str(binding["decision_target_hash"]), pending["decisionTargetHash"])
+        self.assertEqual(str(binding["transition_hash"]), str(attempt["transitionHash"]))
+
+        intent = self.engine.effects.record_pending(
+            company_ref=str(SCOPE_A["companyRef"]),
+            project_ref=str(SCOPE_A["projectRef"]),
+            run_id=self.run_id,
+            node_id=GATE_NODE,
+            transition_hash=str(binding["transition_hash"]),
+            step_id="verification.publish",
+            target_hash=digest("verification-output"),
+            request_hash=digest("verification-publish-request"),
+            provider_ref={
+                "provider": "paperclip",
+                "kind": "interaction",
+                "id": str(pending["requestId"]),
+            },
+        )
+        self.assertEqual(str(intent["transition_hash"]), str(binding["transition_hash"]))
+        self.assertIn(str(pending["requestId"]), str(intent["provider_ref_json"]))
 
     def test_an_unverified_approval_is_refused(self) -> None:
         self._reach_the_gate()

@@ -111,7 +111,7 @@
           ],
           "key": "design.start",
           "requiresFacts": [
-            "requirement_gate_passed"
+            "requirement_acceptance"
           ],
           "startNodes": [
             "architecture"
@@ -267,7 +267,7 @@
           ],
           "key": "implementation.start",
           "requiresFacts": [
-            "design_gate_passed"
+            "design_acceptance"
           ],
           "startNodes": [
             "implementation_plan"

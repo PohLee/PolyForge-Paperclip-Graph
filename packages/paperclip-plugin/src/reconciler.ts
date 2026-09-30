@@ -25,7 +25,7 @@
 
 import { canonicalJson, type ActorAssertion, type ProviderRefLike, type Scope } from "@polyforge/protocol";
 import type { BridgeDeps } from "./ports/index.js";
-import { INTENT_KINDS } from "./outbox/intents.js";
+import { eventIntakeEffectKey, INTENT_KINDS } from "./outbox/intents.js";
 import { DISPATCH_BINDING_KIND, RUN_BINDING_KIND, WORK_UNIT_BINDING_KIND } from "./ports/work-management.js";
 import { AUTHORIZATION_BINDING_KIND, INTERACTION_BINDING_KIND } from "./ports/governance.js";
 import { providerRef } from "./ports/index.js";
@@ -162,8 +162,37 @@ export class Reconciler {
 
         if (row.kind === INTENT_KINDS.eventIntake) {
           // Event intake is idempotent on `source + scope + sourceEventId` at the Core, so a
-          // resend of the same body returns the recorded result. This is a genuine `safe`
-          // retry, not a guess: the identity is the event's own id.
+          // resend of the same body returns the recorded result. Prove that the durable body still
+          // carries that exact identity and scope before using this safe retry path; a malformed or
+          // corrupted row without the Core's dedupe key must remain UNKNOWN rather than be resent.
+          const sourceEventId =
+            typeof payload["sourceEventId"] === "string" && payload["sourceEventId"].trim().length > 0
+              ? payload["sourceEventId"]
+              : null;
+          const eventScope = payload["scope"];
+          const scopeMatches =
+            typeof eventScope === "object" &&
+            eventScope !== null &&
+            !Array.isArray(eventScope) &&
+            (eventScope as Record<string, unknown>)["companyRef"] === scope.companyRef &&
+            (eventScope as Record<string, unknown>)["projectRef"] === scope.projectRef;
+          if (
+            sourceEventId === null ||
+            !scopeMatches ||
+            row.effectKey !== eventIntakeEffectKey(scope, sourceEventId)
+          ) {
+            this.#deps.metrics.bump(companyId, "unknownAttempts");
+            store.updateDelivery(companyId, row.effectKey, {
+              status: "ambiguous",
+              nextAttemptAt: new Date(this.#deps.now().getTime() + 300_000).toISOString(),
+              leaseOwner: null,
+              leaseExpiresAt: null,
+              lastError: "event intake has no matching source/scope idempotency identity; outcome remains unknown",
+            });
+            report.ambiguousStillUnknown += 1;
+            report.issues.push(`event intake ${row.effectKey} has no verified Core idempotency identity`);
+            continue;
+          }
           store.updateDelivery(companyId, row.effectKey, {
             status: "pending",
             nextAttemptAt: this.#deps.now().toISOString(),

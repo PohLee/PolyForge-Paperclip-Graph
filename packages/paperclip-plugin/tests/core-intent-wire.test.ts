@@ -61,13 +61,57 @@ test("a fully populated workspace requirement is carried through unchanged", () 
     ...CORE_WORK_UNIT_PAYLOAD,
     workspaceRequirement: {
       mode: "read_only_snapshot",
-      repositories: [{ repoRef: "core", baseRef: "main", commit: "abc123" }],
+      repositories: [{ repoRef: "core", baseRef: "main", commit: "a".repeat(40) }],
       requireReadOnlyForReviewer: true,
     },
   });
   assert.equal(intent.workspaceRequirement.mode, "read_only_snapshot");
   assert.equal(intent.workspaceRequirement.requireReadOnlyForReviewer, true);
-  assert.equal(intent.workspaceRequirement.repositories[0]?.commit, "abc123");
+  assert.equal(intent.workspaceRequirement.repositories[0]?.commit, "a".repeat(40));
+});
+
+test("an abbreviated repository commit is refused instead of treated as an exact pin", () => {
+  assert.throws(
+    () =>
+      toWorkUnitIntent("work.unit.ensure", {
+        ...CORE_WORK_UNIT_PAYLOAD,
+        workspaceRequirement: {
+          mode: "read_write",
+          repositories: [{ repoRef: "core", baseRef: "main", commit: "abcdef0" }],
+        },
+      }),
+    /full Git object ID/,
+  );
+});
+
+test("a repository requirement without a commit pin is refused before it reaches work management", () => {
+  assert.throws(
+    () =>
+      toWorkUnitIntent("work.unit.ensure", {
+        ...CORE_WORK_UNIT_PAYLOAD,
+        workspaceRequirement: {
+          mode: "read_write",
+          repositories: [{ repoRef: "core", baseRef: "main" }],
+        },
+      }),
+    /no full Git object ID commit pin/,
+  );
+});
+
+test("malformed workspace policies are refused instead of coerced into an empty workspace", () => {
+  const malformed = [
+    "not-an-object",
+    { repositories: [{ repoRef: "core", baseRef: "main" }] },
+    { mode: "read_write", repositories: "core" },
+    { mode: "read_write", repositories: [null] },
+    { mode: "read_write", repositories: [{ repoRef: "core", baseRef: "main", commit: "a".repeat(40), extra: true }] },
+    { mode: "read_write", repositories: [], requireReadOnlyForReviewer: "false" },
+  ];
+  for (const workspaceRequirement of malformed) {
+    assert.throws(() =>
+      toWorkUnitIntent("work.unit.ensure", { ...CORE_WORK_UNIT_PAYLOAD, workspaceRequirement }),
+    );
+  }
 });
 
 test("a payload with no project in its scope is refused, not guessed at", () => {

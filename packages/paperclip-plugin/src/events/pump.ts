@@ -119,7 +119,6 @@ export class EventPump {
   async handle(event: PluginEvent): Promise<HandleOutcome> {
     const { store, inbox, logger, metrics } = this.#deps;
     const companyId = event.companyId;
-    const projectId = this.#projectIdForEvent(event);
     const outcome: MutableOutcome = { normalized: 0, quarantined: 0, ignored: 0, needsRefetch: 0 };
 
     // Learn the company before anything else: this handler is a company-scoped invocation, so it
@@ -127,6 +126,11 @@ export class EventPump {
     // durable record would still be correct, but doing it first means an unconfigured company is
     // visible before work is admitted rather than at delivery time.
     this.#deps.learnCompany(companyId);
+
+    // A newly created issue has no bridge binding yet, and Paperclip's issue event payload does
+    // not consistently include its project. Resolve the relation from Paperclip itself before
+    // recording or signing the event; a projectRef supplied in the issue body would be a claim.
+    const projectId = await this.#projectIdForEvent(event);
 
     // (1) durable first. A duplicate stops here — before any side effect, including any
     // admission decision. This single line is what makes 100 replays produce 1 run.
@@ -199,6 +203,7 @@ export class EventPump {
 
   #enqueueIntake(event: NormalizedEvent, projectId: string | null, outcome: MutableOutcome): void {
     const scope: Scope = { companyRef: event.scope.companyRef, projectRef: projectId ?? event.scope.projectRef };
+    const scopedEvent: NormalizedEvent = { ...event, scope };
     const effectKey = eventIntakeEffectKey(scope, event.sourceEventId);
     const created = this.#deps.enqueue({
       effectKey,
@@ -207,7 +212,7 @@ export class EventPump {
       correlationId: event.correlationId,
       runId: event.runId,
       nodeId: event.nodeId ?? null,
-      payload: event,
+      payload: scopedEvent,
     });
     if (created) outcome.normalized += 1;
     this.#deps.inbox.mark(event.scope.companyRef, event.sourceEventId, "queued");
@@ -306,14 +311,19 @@ export class EventPump {
     return null;
   }
 
-  #projectIdForEvent(event: PluginEvent): string | null {
+  async #projectIdForEvent(event: PluginEvent): Promise<string | null> {
     const payload =
       typeof event.payload === "object" && event.payload !== null
         ? (event.payload as Record<string, unknown>)
         : {};
     const issueIdValue = typeof payload["issueId"] === "string" ? payload["issueId"] : event.entityId;
     if (event.entityType === "issue" || typeof payload["issueId"] === "string") {
-      return issueIdValue === null || issueIdValue === undefined ? null : this.#projectIdForIssue(event.companyId, issueIdValue);
+      if (issueIdValue === null || issueIdValue === undefined) return null;
+      const boundProjectId = this.#projectIdForIssue(event.companyId, issueIdValue);
+      if (boundProjectId !== null) return boundProjectId;
+      const issue = await this.#deps.ctx.issues.get(issueIdValue, event.companyId);
+      if (issue === null || issue.companyId !== event.companyId) return null;
+      return typeof issue.projectId === "string" && issue.projectId.length > 0 ? issue.projectId : null;
     }
     return null;
   }

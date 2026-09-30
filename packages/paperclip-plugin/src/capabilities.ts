@@ -9,7 +9,10 @@
  * widen what that agent is allowed to execute, and independent review collapses because a
  * subject can grant itself the reviewing capability. So bindings live in the bridge store,
  * are keyed by a stable subject, are bound to a Paperclip agent *reference*, and are written
- * only through `seedBindings` (operator / e2e path) or an explicit action.
+ * only through the internal `seedBindings` method today. This checkout has no production
+ * operator grant/revoke surface: the current Plugin SDK action/API actor does not expose a
+ * verifiable administrator bit. Do not add a user-facing writer until the host can prove the
+ * required operator authority; a generic board-user check is not sufficient for widening grants.
  *
  * ## The rule that matters most
  *
@@ -42,6 +45,8 @@ export interface CapabilityBinding {
   readonly subjectRef: string;
   /** The Paperclip agent this subject is bound to. */
   readonly agentId: string;
+  /** The Paperclip project this engineering grant is scoped to. */
+  readonly projectRef: string;
   readonly capabilities: readonly string[];
   /** Paperclip agent roles this subject may be preferred for. */
   readonly roles: readonly string[];
@@ -88,17 +93,21 @@ function parseBinding(payload: unknown): CapabilityBinding | null {
   const record = payload as Record<string, unknown>;
   const subjectRef = record["subjectRef"];
   const agentId = record["agentId"];
-  if (typeof subjectRef !== "string" || typeof agentId !== "string") return null;
+  const projectRef = record["projectRef"];
+  if (typeof subjectRef !== "string" || typeof agentId !== "string" || typeof projectRef !== "string") return null;
   return {
     subjectRef,
     agentId,
+    projectRef,
     capabilities: Array.isArray(record["capabilities"]) ? (record["capabilities"] as string[]) : [],
     roles: Array.isArray(record["roles"]) ? (record["roles"] as string[]) : [],
     independentSubjects: Array.isArray(record["independentSubjects"])
       ? (record["independentSubjects"] as string[])
       : [],
     contractVersion: typeof record["contractVersion"] === "string" ? record["contractVersion"] : "unversioned",
-    enabled: record["enabled"] !== false,
+    // A missing or malformed enable flag is not an implicit grant. Seeded bindings always write
+    // an explicit boolean; old/corrupt rows must remain blocked until explicitly re-seeded.
+    enabled: record["enabled"] === true,
   };
 }
 
@@ -115,15 +124,16 @@ export class CapabilityMatcher {
     this.#store = store;
   }
 
-  bindings(companyId: string): CapabilityBinding[] {
+  bindings(companyId: string, projectId?: string): CapabilityBinding[] {
     return this.#store
       .listBindings(companyId, CAPABILITY_BINDING_KIND)
+      .filter((row) => projectId === undefined || row.projectId === projectId)
       .map((row) => parseBinding(row.payloadJson && safeParse(row.payloadJson)))
       .filter((value): value is CapabilityBinding => value !== null);
   }
 
-  bindingForAgent(companyId: string, agentId: string): CapabilityBinding | null {
-    return this.bindings(companyId).find((binding) => binding.agentId === agentId) ?? null;
+  bindingForAgent(companyId: string, projectId: string, agentId: string): CapabilityBinding | null {
+    return this.bindings(companyId, projectId).find((binding) => binding.agentId === agentId) ?? null;
   }
 
   /**
@@ -134,14 +144,14 @@ export class CapabilityMatcher {
    * Paperclip row id. Looking a subject ref up by agent id can never match, so a dispatch that
    * resolved its worker that way would find no grant and refuse the work.
    */
-  bindingForSubject(companyId: string, subjectRef: string): CapabilityBinding | null {
-    return this.bindings(companyId).find((binding) => binding.subjectRef === subjectRef) ?? null;
+  bindingForSubject(companyId: string, projectId: string, subjectRef: string): CapabilityBinding | null {
+    return this.bindings(companyId, projectId).find((binding) => binding.subjectRef === subjectRef) ?? null;
   }
 
   /**
    * Create or update a binding from an explicit list.
    *
-   * Idempotent on `(company, subject)`, so re-running the operator seed converges instead of
+   * Idempotent on `(company, project, subject)`, so re-running the operator seed converges instead of
    * creating a second grant for the same subject. A binding that narrows capabilities is
    * accepted; nothing here can widen a grant implicitly because the caller supplies the full
    * desired set.
@@ -149,20 +159,22 @@ export class CapabilityMatcher {
   seedBindings(companyId: string, bindings: readonly CapabilityBinding[]): number {
     let written = 0;
     for (const binding of bindings) {
-      if (binding.subjectRef.length === 0 || binding.agentId.length === 0) {
+      if (binding.subjectRef.length === 0 || binding.agentId.length === 0 || binding.projectRef.length === 0) {
         throw new UnsupportedCapabilityError(
           "capability_binding",
-          "a capability binding needs both a subjectRef and an agentId",
+          "a capability binding needs a subjectRef, agentId and projectRef",
           { binding: { subjectRef: binding.subjectRef, agentId: binding.agentId } },
         );
       }
       this.#store.putBinding({
         companyId,
         kind: CAPABILITY_BINDING_KIND,
-        providerId: binding.subjectRef,
+        providerId: `${binding.projectRef}:${binding.subjectRef}`,
+        projectId: binding.projectRef,
         payload: {
           subjectRef: binding.subjectRef,
           agentId: binding.agentId,
+          projectRef: binding.projectRef,
           capabilities: [...binding.capabilities],
           roles: [...binding.roles],
           independentSubjects: [...binding.independentSubjects],
@@ -176,7 +188,20 @@ export class CapabilityMatcher {
   }
 
   removeBinding(companyId: string, subjectRef: string): void {
-    this.#store.deleteBinding(companyId, CAPABILITY_BINDING_KIND, subjectRef);
+    // providerId includes the project (`<projectRef>:<subjectRef>`), so deleting by subjectRef
+    // directly silently leaves every grant active. Match the durable payload instead and remove
+    // each exact provider key; a subject's revocation applies across all project scopes.
+    for (const row of this.#store.listBindings(companyId, CAPABILITY_BINDING_KIND)) {
+      const payload = safeParse(row.payloadJson);
+      if (
+        typeof payload === "object" &&
+        payload !== null &&
+        !Array.isArray(payload) &&
+        (payload as Record<string, unknown>)["subjectRef"] === subjectRef
+      ) {
+        this.#store.deleteBinding(companyId, CAPABILITY_BINDING_KIND, row.providerId);
+      }
+    }
   }
 
   /**
@@ -187,7 +212,7 @@ export class CapabilityMatcher {
    * makes a dispatch replayable.
    */
   resolve(requirement: WorkerRequirement): ResolveReport {
-    const bindings = this.bindings(requirement.scope.companyRef);
+    const bindings = this.bindings(requirement.scope.companyRef, requirement.scope.projectRef);
     const preferred = requirement.preferredRoles ?? [];
     const fallback = requirement.fallbackRoles ?? [];
     const excluded = new Set(requirement.excludeSubjects ?? []);

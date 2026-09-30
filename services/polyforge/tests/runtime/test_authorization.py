@@ -12,17 +12,20 @@ from typing import Any
 from services.polyforge.tests.runtime.fixtures import (
     QA_NODE,
     SCOPE_A,
+    SCOPE_B,
     artifact,
     claim_request,
     definition,
     envelope,
     evidence_for,
+    grant_capability,
     make_engine,
     node_state,
     work_order_request,
 )
 from polyforge.core import errors
 from polyforge.core.contracts.policy import PolicyEffect, PolicyRule
+from polyforge.core.store.models import Scope
 from polyforge.core.state import BlockReason, NodeStatus
 
 
@@ -395,6 +398,34 @@ class PolicyMayNotWidenTests(unittest.TestCase):
         self.assertFalse(policy.is_denied)
         self.assertEqual(policy.granted_authority, "qa.publish")
         self.assertTrue(policy.platform_ceiling_applied)
+
+
+class CapabilitySubjectProjectionTests(unittest.TestCase):
+    def test_policy_subjects_use_only_active_grants_from_the_exact_project(self) -> None:
+        engine, db, _ = make_engine()
+        grant_capability(db, "agent:paperclip/a", "requirement.clarify", scope=SCOPE_A)
+        grant_capability(db, "agent:paperclip/a", "requirement.baseline", scope=SCOPE_A)
+        grant_capability(db, "agent:paperclip/b", "requirement.clarify", scope=SCOPE_A)
+        grant_capability(db, "agent:paperclip/c", "requirement.clarify", scope=SCOPE_B)
+        grant_capability(
+            db,
+            "agent:paperclip/d",
+            "requirement.clarify",
+            scope=SCOPE_A,
+            revoked=True,
+        )
+
+        self.assertEqual(
+            engine.capability_subjects(Scope.from_wire(SCOPE_A), ["requirement.clarify"]),
+            ["agent:paperclip/a", "agent:paperclip/b"],
+        )
+        self.assertEqual(
+            engine.capability_subjects(
+                Scope.from_wire(SCOPE_A),
+                ["requirement.clarify", "requirement.baseline"],
+            ),
+            ["agent:paperclip/a"],
+        )
 
 
 if __name__ == "__main__":

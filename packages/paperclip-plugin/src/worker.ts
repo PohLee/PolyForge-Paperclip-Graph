@@ -42,7 +42,7 @@ import { join } from "node:path";
 
 import manifestJson from "./manifest.js";
 import { ConfigRegistry, resolveConfig, validateSecretRefShape, type BridgeConfig } from "./config.js";
-import { BridgeConfigError, BridgeError } from "./errors.js";
+import { BridgeConfigError, BridgeError, ScopeViolationError } from "./errors.js";
 import { createLogger, type BridgeLogger } from "./logger.js";
 import { BridgeStore } from "./store.js";
 import { BridgeMetrics } from "./metrics.js";
@@ -71,7 +71,7 @@ import {
 import type { ToolHandlerDeps } from "./tools/register.js";
 import { companyScope } from "./identity.js";
 import { isBridgeError } from "./errors.js";
-import type { ActorAssertion, RunSnapshot, Scope, WorkerRequirement } from "@polyforge/protocol";
+import type { ActorAssertion, CreateWorkOrderRequest, RunSnapshot, Scope, WorkerRequirement } from "@polyforge/protocol";
 
 const manifest = manifestJson as PaperclipPluginManifestV1;
 
@@ -240,6 +240,19 @@ function toolWiringOf(shared: Bridge): ToolWiring {
     metrics: shared.metrics,
     logger: shared.logger,
     company: (companyId: string) => companyOf(shared, companyId),
+    issueExecution: async (companyId: string, issueId: string) => {
+      const ctx = shared.ctx;
+      if (ctx === null) return null;
+      const issue = await ctx.issues.get(issueId, companyId);
+      if (issue === null) return null;
+      return {
+        companyId: issue.companyId,
+        projectId: issue.projectId,
+        assigneeAgentId: issue.assigneeAgentId,
+        executionRunId: issue.executionRunId,
+        status: issue.status,
+      };
+    },
   };
 }
 
@@ -419,10 +432,20 @@ function toolRuntimeFor(company: CompanyContext): ToolRuntime {
       companyId: company.companyId,
     });
   }
-  const scope = (runId: string): Scope => scopeForRun(company, runId);
+  const scope = (companyId: string, runId: string): Scope => {
+    if (companyId !== company.companyId) {
+      company.metrics.bump(company.companyId, "crossScopeDenials");
+      throw new ScopeViolationError("tool runtime company does not match the authenticated bridge context", {
+        authenticatedCompany: company.companyId,
+        requestedCompany: companyId,
+        runId,
+      });
+    }
+    return scopeForRun(company, runId);
+  };
   return {
-    getRun: async (_companyId, runId) => {
-      const snapshot = (await client.getRun(SYSTEM_ACTOR, scope(runId), runId)) as RunSnapshot;
+    getRun: async (companyId, runId) => {
+      const snapshot = (await client.getRun(SYSTEM_ACTOR, scope(companyId, runId), runId)) as RunSnapshot;
       return {
         runId: snapshot.runId,
         stateVersion: snapshot.stateVersion,
@@ -472,8 +495,8 @@ function toolRuntimeFor(company: CompanyContext): ToolRuntime {
         })),
       };
     },
-    current: async (_companyId, runId) => {
-      const raw = await client.current(SYSTEM_ACTOR, scope(runId), runId);
+    current: async (companyId, runId) => {
+      const raw = await client.current(SYSTEM_ACTOR, scope(companyId, runId), runId);
       const record = readJson(JSON.stringify(raw));
 
       // The Core nests this. `contract` carries the hash, the required evidence kinds, the inputs,
@@ -541,11 +564,11 @@ function toolRuntimeFor(company: CompanyContext): ToolRuntime {
             : previousOwnerAgentRunId,
       };
     },
-    claim: async (_companyId, runId, body) => client.claim(SYSTEM_ACTOR, scope(runId), runId, body),
-    submitArtifacts: async (_companyId, runId, body) => client.submitArtifacts(SYSTEM_ACTOR, scope(runId), runId, body),
-    submitEvidence: async (_companyId, runId, body) => client.submitEvidence(SYSTEM_ACTOR, scope(runId), runId, body),
-    requestTransition: async (_companyId, runId, body) => client.requestTransition(SYSTEM_ACTOR, scope(runId), runId, body),
-    requestHelp: async (_companyId, runId, body) => client.requestHelp(SYSTEM_ACTOR, scope(runId), runId, body),
+    claim: async (companyId, runId, body) => client.claim(SYSTEM_ACTOR, scope(companyId, runId), runId, body),
+    submitArtifacts: async (companyId, runId, body) => client.submitArtifacts(SYSTEM_ACTOR, scope(companyId, runId), runId, body),
+    submitEvidence: async (companyId, runId, body) => client.submitEvidence(SYSTEM_ACTOR, scope(companyId, runId), runId, body),
+    requestTransition: async (companyId, runId, body) => client.requestTransition(SYSTEM_ACTOR, scope(companyId, runId), runId, body),
+    requestHelp: async (companyId, runId, body) => client.requestHelp(SYSTEM_ACTOR, scope(companyId, runId), runId, body),
   };
 }
 
@@ -802,9 +825,9 @@ const plugin: PluginDefinition = {
     const pump = shared.pump;
     const registry = shared.registry;
 
-    registerIntentHandlers(pump, (id) => companyOf(shared, id));
-    registerTools(ctx, toolDepsFor(toolWiringOf(shared)));
     const resolve = resolverFor(shared);
+    registerIntentHandlers(pump, resolve);
+    registerTools(ctx, toolDepsFor(toolWiringOf(shared)));
     registerDataKeys(ctx, resolve);
     registerActionKeys(
       (key, handler) => {
@@ -1076,6 +1099,23 @@ const plugin: PluginDefinition = {
       });
       return;
     }
+
+    // This hook is the authoritative config push. Do not depend on a deferred config.get here:
+    // the host invocation scope expires when the current hook returns, so a timer-based read is
+    // rejected as an unknown invocation scope after a restart or first install.
+    if (typeof newConfig["runtimeUrl"] === "string" && newConfig["runtimeUrl"].trim() !== "") {
+      try {
+        shared.registry.load(companyId, newConfig);
+        recordDiscovery(shared, companyId, "loaded", { keys: Object.keys(newConfig).sort() });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        recordDiscovery(shared, companyId, "configuration_unusable", { error: message.slice(0, 300) });
+        shared.logger.warn("a pushed company configuration could not be used", { companyId, error: message });
+      }
+    } else {
+      recordDiscovery(shared, companyId, "no_configuration_set");
+    }
+
     const previous = companyOf(shared, companyId);
     shared.companies.delete(companyId);
     shared.logger.info("company configuration changed; its bridge will rebuild on next use", {
@@ -1106,7 +1146,7 @@ const plugin: PluginDefinition = {
         body: { error: { code: "BRIDGE_STORE_UNAVAILABLE", message: "the bridge is not running" } },
       };
     }
-    return createApiRequestHandler(resolverFor(shared))(input);
+    return createApiRequestHandler(resolverFor(shared), toolDepsFor(toolWiringOf(shared)))(input);
   },
 
   multiCompanyConfig: true,
@@ -1225,6 +1265,13 @@ export interface ToolWiring {
   readonly metrics: BridgeMetrics;
   readonly logger: BridgeLogger;
   company(companyId: string): CompanyContext | null;
+  issueExecution(companyId: string, issueId: string): Promise<{
+    companyId: string;
+    projectId: string | null;
+    assigneeAgentId: string | null;
+    executionRunId: string | null;
+    status: string;
+  } | null>;
 }
 
 function toolDepsFor(wiring: ToolWiring): ToolHandlerDeps {
@@ -1279,6 +1326,34 @@ function toolDepsFor(wiring: ToolWiring): ToolHandlerDeps {
             contractHash: typeof payload["contractHash"] === "string" ? payload["contractHash"] : null,
           };
         }
+      }
+      return null;
+    },
+    bindingForIssueExecution: async (companyId, issueId, agentId, agentRunId): Promise<ToolRunBinding | null> => {
+      // requestWakeup may queue an automation without returning the heartbeat id Paperclip
+      // creates later. Recover that association only from Paperclip's current issue execution,
+      // never from values supplied in the agent's request body.
+      const issue = await wiring.issueExecution(companyId, issueId);
+      if (
+        issue === null ||
+        issue.companyId !== companyId ||
+        issue.assigneeAgentId !== agentId ||
+        issue.executionRunId !== agentRunId ||
+        issue.status !== "in_progress"
+      ) return null;
+      for (const row of store.listBindings(companyId, WORK_UNIT_BINDING_KIND, 2000)) {
+        const payload = readJson(row.payloadJson);
+        if (payload["issueId"] !== issueId || typeof payload["runId"] !== "string") continue;
+        if (row.projectId.length === 0 || row.projectId !== issue.projectId) continue;
+        return {
+          companyId,
+          runId: payload["runId"],
+          nodeId: typeof payload["nodeId"] === "string" ? payload["nodeId"] : "",
+          iteration: typeof payload["iteration"] === "number" ? payload["iteration"] : 0,
+          issueId,
+          projectId: row.projectId,
+          contractHash: typeof payload["contractHash"] === "string" ? payload["contractHash"] : null,
+        };
       }
       return null;
     },
@@ -1387,7 +1462,11 @@ function registerIntentHandlers(
     handler(kind, async (row) => {
       const company = resolveCompany(row.companyId);
       if (company === null || company.runtime === null) {
-        return { status: "observed", reason: "no runtime client for this company; will retry", retryAfterMs: 60_000 };
+        // Configuration discovery is deferred out of the host RPC that delivered the event. The
+        // first outbox pass can therefore run before the per-company bridge has been constructed.
+        // `observed` is terminal in OutboxPump; this must remain queued for a safe retry after
+        // `learnCompany` has populated the registry.
+        return { status: "retry", reason: "no runtime client for this company yet", retryAfterMs: 60_000 };
       }
       const payload = readJson(row.payloadJson);
       const result = await call(company, payload, row);
@@ -1442,6 +1521,15 @@ function registerIntentHandlers(
           typeof payload["inputSnapshot"] === "object" && payload["inputSnapshot"] !== null
             ? (payload["inputSnapshot"] as Record<string, unknown>)
             : {},
+        ...(typeof payload["workspaceRequirement"] === "object" && payload["workspaceRequirement"] !== null
+          ? { workspaceRequirement: payload["workspaceRequirement"] as CreateWorkOrderRequest["workspaceRequirement"] }
+          : {}),
+        ...(typeof payload["requiredFactSources"] === "object" && payload["requiredFactSources"] !== null
+          ? { requiredFactSources: payload["requiredFactSources"] as CreateWorkOrderRequest["requiredFactSources"] }
+          : {}),
+        policyRules: Array.isArray(payload["policyRules"])
+          ? (payload["policyRules"] as CreateWorkOrderRequest["policyRules"])
+          : [],
         commandId: `work-order:${String(payload["startIntentId"])}`,
         idempotencyKey: row.effectKey,
         correlationId: row.correlationId,

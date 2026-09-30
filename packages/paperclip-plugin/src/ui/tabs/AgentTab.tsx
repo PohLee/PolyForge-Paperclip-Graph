@@ -112,7 +112,7 @@ function CapabilityBindings(props: { agent: AgentView }): ReactNode {
       <table style={{ borderCollapse: "collapse", width: "100%", fontSize: 12 }}>
         <thead>
           <tr>
-            {["Capabilities", "Run", "Node", "Scope", "Granted"].map((header) => (
+            {["Capabilities", "Project", "Run", "Node", "Granted"].map((header) => (
               <th key={header} scope="col" style={{ textAlign: "left", padding: "2px 6px" }}>
                 {header}
               </th>
@@ -123,9 +123,9 @@ function CapabilityBindings(props: { agent: AgentView }): ReactNode {
           {agent.engineeringBindings.map((binding, index) => (
             <tr key={`${binding.agentId}:${index}`} style={{ borderTop: "1px solid var(--pf-border, rgba(127,127,127,0.18))" }}>
               <td>{formatList(binding.capabilities, "no capabilities recorded")}</td>
+              <td>{binding.projectRef ?? "not project-bound"}</td>
               <td>{binding.runId === null ? "not run-scoped" : <Identifier id={binding.runId} label="run" />}</td>
               <td>{binding.nodeId === null ? "not node-scoped" : <code>{binding.nodeId}</code>}</td>
-              <td>{binding.scope ?? "not reported"}</td>
               <td>{binding.grantedAt === null ? "not reported" : formatInstantPair(binding.grantedAt)}</td>
             </tr>
           ))}

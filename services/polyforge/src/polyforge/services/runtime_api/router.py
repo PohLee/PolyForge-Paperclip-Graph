@@ -724,36 +724,9 @@ ENDPOINTS: Final[tuple[Endpoint, ...]] = (
         parameters=(
             _RUN,
             Parameter("nodeId", "query", False, "string", "Node to inspect; defaults to the current one."),
-            Parameter("adopt", "query", False, "boolean", "Also take over the current attempt."),
-            Parameter(
-                "priorWorkerState",
-                "query",
-                False,
-                "string",
-                "What the platform confirmed about the previous worker. Required for a takeover.",
-            ),
         ),
         response_schema="CurrentView",
         response_description="The pinned contract and what this attempt may do next. Read only.",
-    ),
-    Endpoint(
-        method="POST",
-        path="/runs/{runId}/current",
-        name="adopt_current",
-        summary="Read the current contract and, with adopt, take over the current attempt",
-        tag="execution",
-        success_status=200,
-        failure_codes=_COMMON
-        + (ErrorCode.LEASE_FENCED.value, ErrorCode.VERSION_CONFLICT.value, ErrorCode.RUN_BLOCKED.value),
-        parameters=(_RUN,),
-        request_schema="AdoptRequest",
-        response_schema="CurrentView",
-        response_description=(
-            "The same view as the GET, plus a controlled takeover. A takeover is a write, so it "
-            "needs a body: the platform's confirmation about the previous worker cannot ride in "
-            "a query string, and a takeover performed by a GET would be a surprise to every cache "
-            "between here and the Core."
-        ),
     ),
     Endpoint(
         method="POST",

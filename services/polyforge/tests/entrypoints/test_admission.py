@@ -40,13 +40,13 @@ class HappyPathTest(unittest.TestCase):
             definition,
             "design.start",
             input_snapshot={"requirement_baseline": "rb-1"},
-            required_facts={"requirement_gate_passed": _fact()},
+            required_facts={"requirement_acceptance": _fact()},
             capability_bindings=[_binding("agent:designer-1", ["design.coordinate"])],
         )
         self.assertTrue(result.ok, [b.to_dict() for b in result.blockers])
         self.assertEqual(result.resolved_entrypoint["startNodes"], ["architecture"])
         self.assertEqual(result.coordinator_requirement["satisfiedBy"], "agent:designer-1")
-        self.assertEqual(result.required_facts, ["requirement_gate_passed"])
+        self.assertEqual(result.required_facts, ["requirement_acceptance"])
         self.assertEqual(result.blockers, [])
 
     def test_every_library_graph_admits_its_main_entry(self):
@@ -81,7 +81,7 @@ class InputTest(unittest.TestCase):
             load_graph("design"),
             "design.start",
             input_snapshot={},
-            required_facts={"requirement_gate_passed": _fact()},
+            required_facts={"requirement_acceptance": _fact()},
             capability_bindings=[_binding("agent:designer-1", ["design.coordinate"])],
         )
         self.assertFalse(result.ok)
@@ -260,7 +260,7 @@ class ResumeTest(unittest.TestCase):
             self.definition,
             "design.start",
             input_snapshot={"requirement_baseline": "rb-1"},
-            required_facts={"requirement_gate_passed": _fact()},
+            required_facts={"requirement_acceptance": _fact()},
             capability_bindings=[_binding("agent:designer-1", ["design.coordinate"])],
             resume_context={"checkpointKind": "anything", "invocationGeneration": 1},
         )
@@ -275,7 +275,7 @@ class CapabilityTest(unittest.TestCase):
             definition or load_graph("design"),
             key,
             input_snapshot={"requirement_baseline": "rb-1"},
-            required_facts={"requirement_gate_passed": _fact()},
+            required_facts={"requirement_acceptance": _fact()},
             capability_bindings=bindings,
         )
 
@@ -335,7 +335,7 @@ class CapabilityTest(unittest.TestCase):
             definition,
             "implementation.start",
             input_snapshot={"design_acceptance": "da-1"},
-            required_facts={"design_gate_passed": _fact()},
+            required_facts={"design_acceptance": _fact()},
             capability_bindings=[_binding("agent:tech-lead-1", ["implementation.coordinate"])],
         )
         self.assertTrue(result.ok, [b.to_dict() for b in result.blockers])
@@ -356,7 +356,7 @@ class CapabilityTest(unittest.TestCase):
         self.assertTrue(body["ok"])
         self.assertEqual(body["coordinatorRequirement"]["satisfiedBy"], "agent:designer-1")
         self.assertEqual(body["blockers"], [])
-        self.assertEqual(body["requiredFacts"], ["requirement_gate_passed"])
+        self.assertEqual(body["requiredFacts"], ["requirement_acceptance"])
 
     def test_a_malformed_snapshot_is_a_bad_request(self):
         with self.assertRaises(PolyForgeError) as caught:

@@ -1,6 +1,6 @@
 /**
- * AT-09 — Runtime Service offline, retry with backoff, single-flight, ambiguity, dead-letter.
- * (docs/03 §10 AT-09: "Runtime 断开→重试→不重复/单飞/心跳与健康/死信后人工可见")
+ * Outbox delivery — Runtime Service offline, retry with backoff, single-flight, ambiguity, dead-letter.
+ * This is not docs/03 §10 AT-09 (evidence immutability). A subset is explicitly tagged AT-26 below.
  *
  * The fake Runtime is a real HTTP server, so "offline" here means the socket is gone, the response
  * never arrives, or the Core answers with a protocol error. Which of those a failure is decides
@@ -24,13 +24,17 @@ const h = await load<typeof import("./helpers/harness.ts")>(new URL("./helpers/h
 const intents = await load<typeof import("../src/outbox/intents.ts")>(
   new URL("../src/outbox/intents.ts", import.meta.url),
 );
+const worker = await load<typeof import("../src/worker.ts")>(new URL("../src/worker.ts", import.meta.url));
+const delivery = await load<typeof import("../src/outbox/delivery.ts")>(
+  new URL("../src/outbox/delivery.ts", import.meta.url),
+);
 
 const { COMPANY_A, PROJECT_A, buildBridge, company, project, issue } = h;
 const bridges: { dispose(): void }[] = [];
-after(() => {
-  for (const bridge of bridges) bridge.dispose();
+after(async () => {
+  for (const bridge of bridges) await bridge.dispose();
 });
-function track<T extends { dispose(): void }>(bridge: T): T {
+function track<T extends { dispose(): Promise<void> }>(bridge: T): T {
   bridges.push(bridge);
   return bridge;
 }
@@ -87,7 +91,7 @@ function refuse(
   });
 }
 
-test("AT-09: a queued intent survives the Runtime being unreachable and is not lost", async () => {
+ test("OUTBOX: a queued intent survives the Runtime being unreachable and is not lost", async () => {
   const bridge = track(await withBridge());
   assert.equal(bridge.company.deliveries.begin(observation()), true);
 
@@ -100,7 +104,37 @@ test("AT-09: a queued intent survives the Runtime being unreachable and is not l
   assert.equal(bridge.store.countDeliveries(COMPANY_A, "reconciled"), 0);
 });
 
-test("AT-09: one effect key is single-flight — concurrent pumps send it once", async () => {
+test("a Core delivery retries until company configuration has produced a Runtime client", async () => {
+  const bridge = track(await withBridge());
+  let companyContext: h.TestBridge["company"] | null = null;
+  let clockMs = 1_700_000_000_000;
+  const pump = new delivery.OutboxPump({
+    store: bridge.store,
+    logger: bridge.company.logger,
+    metrics: bridge.metrics,
+    now: () => new Date(clockMs),
+    ownerId: "test-config-discovery",
+    jitter: () => 0.5,
+  });
+  worker.__testing.registerIntentHandlers(pump, () => companyContext);
+  bridge.company.deliveries.begin(observation({ effectKey: "pf.at09.config-discovery" }));
+
+  const first = await pump.pumpOnce([COMPANY_A]);
+  assert.equal(first.retried, 1, "a missing company context is retryable, not a terminal observation");
+  assert.equal(bridge.store.countDeliveries(COMPANY_A, "pending"), 1);
+  assert.equal(bridge.runtime.requestsTo("POST", "/events").length, 0);
+
+  companyContext = bridge.company;
+  clockMs += 60_000;
+  bridge.advanceClock(60_000);
+  const second = await pump.pumpOnce([COMPANY_A]);
+  assert.equal(second.reconciled, 1);
+  assert.equal(bridge.store.countDeliveries(COMPANY_A, "reconciled"), 1);
+  assert.equal(bridge.runtime.requestsTo("POST", "/events").length, 1);
+  assert.equal(bridge.runtime.requests.at(-1)?.signatureValid, true);
+});
+
+ test("AT-26: one effect key is single-flight — concurrent pumps send it once", async () => {
   const bridge = track(await withBridge());
   // Two passes racing over the same queue: a job firing while a reconcile is already running.
   bridge.company.deliveries.begin(observation());
@@ -117,7 +151,7 @@ test("AT-09: one effect key is single-flight — concurrent pumps send it once",
   assert.equal(bridge.runtime.intake.length, 1);
 });
 
-test("AT-09: the same intent begun twice is one row, and the second begin is refused", async () => {
+ test("AT-26: the same intent begun twice is one row, and the second begin is refused", async () => {
   const bridge = track(await withBridge());
   assert.equal(bridge.company.deliveries.begin(observation()), true);
   assert.equal(bridge.company.deliveries.begin(observation()), false, "a duplicate effect key is refused");
@@ -128,7 +162,7 @@ test("AT-09: the same intent begun twice is one row, and the second begin is ref
   assert.equal(bridge.runtime.intake.length, 1);
 });
 
-test("AT-09: a request that never answers is ambiguous, and is never blindly resent", async () => {
+ test("AT-26: a request that never answers is ambiguous, and is never blindly resent", async () => {
   const bridge = track(await withBridge());
   // The Core took the connection and went silent. The bridge cannot know whether the write
   // landed, so the only honest state is `ambiguous`, to be resolved by reading back.
@@ -145,7 +179,7 @@ test("AT-09: a request that never answers is ambiguous, and is never blindly res
   assert.equal(bridge.runtime.requestsTo("POST", "/events").length, 1);
 });
 
-test("AT-09: a 503 the Core marks reconcile_required is ambiguous, not a retry", async () => {
+ test("AT-26: a 503 the Core marks reconcile_required is ambiguous, not a retry", async () => {
   const bridge = track(await withBridge());
   // `CONTROL_PLANE_UNAVAILABLE` is the protocol's own "may have taken effect" answer. Treating it
   // as a plain retry is how a control-plane restart duplicates an event.
@@ -156,7 +190,7 @@ test("AT-09: a 503 the Core marks reconcile_required is ambiguous, not a retry",
   assert.equal(bridge.store.countDeliveries(COMPANY_A, "ambiguous"), 1);
 });
 
-test("AT-09: a deterministic rejection is dead-lettered at once and never retried", async () => {
+ test("OUTBOX: a deterministic rejection is dead-lettered at once and never retried", async () => {
   const bridge = track(await withBridge());
   // 422 CONTRACT_INVALID will not become valid by trying again.
   refuse(bridge.runtime, 422, "CONTRACT_INVALID", "payload is not a valid observation");
@@ -173,7 +207,7 @@ test("AT-09: a deterministic rejection is dead-lettered at once and never retrie
   assert.equal(bridge.store.countDeliveries(COMPANY_A, "observed"), 0, "a rejection is not an effect that happened");
 });
 
-test("AT-09: a safe rejection retries with a backoff and succeeds once the Core is ready", async () => {
+ test("OUTBOX: a safe rejection retries with a backoff and succeeds once the Core is ready", async () => {
   const bridge = track(await withBridge({ baseBackoffMs: 50 }));
   // `VERSION_CONFLICT` is `safe`: the command is idempotent, so replaying it returns the
   // recorded result rather than applying anything twice.
@@ -205,7 +239,7 @@ test("AT-09: a safe rejection retries with a backoff and succeeds once the Core 
   assert.equal(bridge.store.countDeliveries(COMPANY_A, "pending"), 0);
 });
 
-test("AT-09: the redelivery budget is finite and the intent ends as a visible dead letter", async () => {
+ test("OUTBOX: the redelivery budget is finite and the intent ends as a visible dead letter", async () => {
   const bridge = track(await withBridge({ baseBackoffMs: 1 }));
   refuse(bridge.runtime, 409, "VERSION_CONFLICT", "stale", 99);
   bridge.company.deliveries.begin(observation());
@@ -223,7 +257,7 @@ test("AT-09: the redelivery budget is finite and the intent ends as a visible de
   assert.equal(bridge.store.countDeliveries(COMPANY_A, "failed"), 1);
 });
 
-test("AT-09: a delivered intent is terminal and is never re-sent", async () => {
+ test("AT-26: a delivered intent is terminal and is never re-sent", async () => {
   const bridge = track(await withBridge());
   bridge.company.deliveries.begin(observation());
   await bridge.drain();
@@ -235,7 +269,25 @@ test("AT-09: a delivered intent is terminal and is never re-sent", async () => {
   assert.equal(bridge.runtime.intake.length, 1);
 });
 
-test("AT-09: two companies' queues never mix, even for the same effect key", async () => {
+ test("OUTBOX: a new issue event derives its project scope from Paperclip before intake", async () => {
+  const bridge = track(await withBridge());
+  // Paperclip's issue.created event does not carry projectId, and a new issue has no local bridge
+  // binding yet. The scope must therefore come from the host's authoritative issue read.
+  const outcome = await bridge.eventPump.handle(
+    h.hostEvent(
+      "issue.created",
+      "event-unbound-root-1",
+      { issueId: "root-1", status: "todo", labels: [] },
+      { entityId: "root-1", entityType: "issue" },
+    ),
+  );
+  assert.equal(outcome.normalized, 1);
+  await bridge.drain();
+  assert.equal(bridge.runtime.intake.length, 1);
+  assert.deepEqual(bridge.runtime.intake[0]?.["scope"], { companyRef: COMPANY_A, projectRef: PROJECT_A });
+});
+
+ test("AT-29: two companies' queues never mix, even for the same effect key", async () => {
   const bridge = track(
     await buildBridge({
       extraCompanyIds: ["company-b"],
@@ -270,7 +322,7 @@ test("AT-09: two companies' queues never mix, even for the same effect key", asy
   assert.deepEqual(scopes.sort(), ["company-a", "company-b"]);
 });
 
-test("AT-09: every request the bridge makes is correctly signed, even when it fails", async () => {
+ test("OUTBOX: every request the bridge makes is correctly signed, even when it fails", async () => {
   // A divergence between the TypeScript and Python canonical encoders would show up as a `401`
   // in production and nowhere else, so the fake recomputes the signature from the bytes it
   // received and this asserts it, on the failure paths too.

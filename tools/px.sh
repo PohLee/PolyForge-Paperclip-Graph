@@ -15,7 +15,22 @@
 set -uo pipefail
 
 SRC_ROOT="${POLYFORGE_REPO_WSL:-/mnt/d/Projects/00.Own/05.AI-Ops/PolyForge-Paperclip-Graph}"
-RUN_DIR="${POLYFORGE_RUN_DIR:-/home/pohlee/.polyforge/run}"
+PF_DATA_DIR="${PF_DATA_DIR:-/home/pohlee/.polyforge}"
+RUN_DIR="${POLYFORGE_RUN_DIR:-$PF_DATA_DIR/run}"
+
+# `px` replaces the copied script and ops directories on every invocation. Canonicalize both
+# paths before touching either one so an override or a symlink cannot redirect that cleanup
+# outside the dedicated PolyForge data directory.
+PF_ROOT="$(realpath -m "$PF_DATA_DIR")"
+RUN_DIR="$(realpath -m "$RUN_DIR")"
+case "$RUN_DIR" in
+  "$PF_ROOT"/*) ;;
+  *) echo "px: run directory must be a child of PF_DATA_DIR ($PF_ROOT): $RUN_DIR" >&2; exit 1 ;;
+esac
+[[ "$PF_ROOT" != "/" && "$RUN_DIR" != "$PF_ROOT" ]] || {
+  echo "px: refusing unsafe run directory: $RUN_DIR" >&2
+  exit 1
+}
 
 # Wait for a *real read*, not a stat: the automount reports files as present while failing reads.
 ready=0

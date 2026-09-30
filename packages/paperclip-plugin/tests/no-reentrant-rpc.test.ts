@@ -56,6 +56,15 @@ test("no lifecycle hook awaits a host call", () => {
   }
 });
 
+test("a company config push seeds the registry before its invocation scope expires", () => {
+  const hook = bodyOf(worker, "async onConfigChanged(", 2200);
+  assert.match(
+    hook,
+    /registry\.load\(companyId,\s*newConfig\)/,
+    "the host already supplied the config; caching that push avoids a deferred config.get with an expired scope",
+  );
+});
+
 test("the company resolver learns the company without awaiting the host", () => {
   const resolver = bodyOf(worker, "function resolverFor(", 1600);
   assert.match(resolver, /learnCompany\(shared, companyId\)/, "the resolver must learn the company");

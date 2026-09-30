@@ -57,6 +57,15 @@ const targets = [
     ...common,
     entryPoints: [path.join(root, "src/ui/index.tsx")],
     outfile: path.join(root, "dist/ui/index.js"),
+    // Keep the UI build's JSX runtime aligned with tsconfig.ui.json. Without
+    // this, esbuild reads tsconfig.json (which has no JSX setting) and emits
+    // React.createElement calls, but the host only provides the automatic JSX
+    // runtime module and never installs a global React variable.
+    tsconfig: path.join(root, "tsconfig.ui.json"),
+    // The host rewrites bare imports in the UI bundle before importing it. Its
+    // loader matches the readable `from "react"` form, so keep this bundle
+    // unminified (the SDK bundler preset also defaults to minify: false).
+    minify: false,
     platform: "browser",
     target: "es2022",
     external: UI_EXTERNALS,

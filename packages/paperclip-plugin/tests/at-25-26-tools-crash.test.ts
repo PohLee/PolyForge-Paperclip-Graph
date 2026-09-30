@@ -21,13 +21,16 @@ const sdk = await load<typeof import("@paperclipai/plugin-sdk")>("@paperclipai/p
 const register = await load<typeof import("../src/tools/register.ts")>(
   new URL("../src/tools/register.ts", import.meta.url),
 );
+const intents = await load<typeof import("../src/outbox/intents.ts")>(
+  new URL("../src/outbox/intents.ts", import.meta.url),
+);
 
 const { COMPANY_A, PROJECT_A, GRAPH_ID, ENTRYPOINT, buildBridge, company, project, issue, label, hostEvent } = h;
 const bridges: { dispose(): void }[] = [];
-after(() => {
-  for (const bridge of bridges) bridge.dispose();
+after(async () => {
+  for (const bridge of bridges) await bridge.dispose();
 });
-function track<T extends { dispose(): void }>(bridge: T): T {
+function track<T extends { dispose(): Promise<void> }>(bridge: T): T {
   bridges.push(bridge);
   return bridge;
 }
@@ -261,9 +264,14 @@ test("AT-25: the run survives the agent session ending", async () => {
   assert.ok(bridge.store.getBinding(COMPANY_A, register.CLAIM_BINDING_KIND, "run-1:n1:0"));
 });
 
-test("AT-25: another qualified agent may take over, and only under the lease", async () => {
+test("AT-25/AT-28: takeover follows an expired lease only after the old agent run is gone", async () => {
   const bridge = track(await withRun());
   await bridge.callTool("current", { adopt: true }, runCtx());
+  const leaseAge = bridge.runtime.leaseTtlMs + 1;
+  bridge.runtime.advanceClock(leaseAge);
+  bridge.advanceClock(leaseAge);
+  const held = bridge.runtime.leases.get("run-1|n1|0");
+  assert.ok(held && held.expiresAtMs <= bridge.runtime.nowMs(), "the Core lease must actually be expired");
   // The second agent is dispatched to the same node, and holds a capability grant.
   bridge.store.putBinding({
     companyId: COMPANY_A,
@@ -283,17 +291,26 @@ test("AT-25: another qualified agent may take over, and only under the lease", a
   h.seedCapabilityBinding(bridge, COMPANY_A, `agent:paperclip/${OTHER_AGENT_ID}`, OTHER_AGENT_ID);
   const second = runCtx({ agentId: OTHER_AGENT_ID, runId: OTHER_AGENT_RUN, callId: "call-2" });
 
-  // While the first lease is live, the second agent is fenced out.
+  // While the first platform run is still active, the stop observation is unknown and takeover
+  // does not reach the Core, even though the lease timer has expired.
+  bridge.harness.seed({
+    issues: [issue("root-1", COMPANY_A, PROJECT_A, {
+      activeRun: { id: AGENT_RUN, status: "running", agentId: AGENT_ID },
+    })],
+  });
   const fenced = envelope(await bridge.callTool("current", { adopt: true }, second));
   assert.notEqual(fenced["status"], "CLAIMED");
 
-  // The old lease expires — that is the controlled part, not a race.
-  bridge.runtime.expireLeases();
+  // Once the provider reports the old run is gone, the bridge submits the exact next epoch.
+  bridge.harness.seed({ issues: [issue("root-1", COMPANY_A, PROJECT_A, { activeRun: null })] });
   const taken = envelope(await bridge.callTool("current", { adopt: true }, second));
   assert.equal(taken["status"], "CLAIMED");
   const claim = (taken["data"] as Record<string, unknown>)["claim"] as Record<string, unknown>;
   assert.equal(claim["leaseEpoch"], 2, "a takeover advances the epoch so the old attempt is fenced");
   assert.equal(claim["invalidatesPreviousAttempt"], true);
+  const submittedClaim = bridge.runtime.claims.at(-1);
+  assert.equal(submittedClaim?.["leaseEpoch"], 2);
+  assert.equal(submittedClaim?.["priorWorkerState"], "stopped");
   // The first agent is now fenced on its own next write, which is what stops two owners.
   const stale = await bridge.callTool(
     "submit_evidence",
@@ -513,16 +530,24 @@ test("AT-26: a create that timed out is resolved by reading back, not by resendi
   assert.equal(bridge.runtime.runs.has(runId), true);
 });
 
-test("AT-26: a crash after the write leaves the queue replayable and the effect unrepeated", async () => {
+test("AT-26: an expired sent event stays ambiguous until reconciliation permits an idempotent replay", async () => {
   const bridge = track(await withRun());
+  const scope = { companyRef: COMPANY_A, projectRef: PROJECT_A };
+  const sourceEventId = "evt-crash-restart";
+  const effectKey = intents.eventIntakeEffectKey(scope, sourceEventId);
   // A row the pump claimed and never settled: exactly the state a crash between "sent" and
   // "observed" leaves behind.
   bridge.company.deliveries.begin({
-    effectKey: "pf.crash.simulation",
-    kind: "event.intake" as never,
-    scope: { companyRef: COMPANY_A, projectRef: PROJECT_A },
+    effectKey,
+    kind: intents.INTENT_KINDS.eventIntake,
+    scope,
     correlationId: "corr-crash",
-    payload: { type: "pf.execution.observed", payload: { observationOnly: true } },
+    payload: {
+      type: "pf.execution.observed",
+      sourceEventId,
+      scope,
+      payload: { observationOnly: true },
+    },
   });
   const claimed = bridge.store.claimDueDeliveries({
     companyId: COMPANY_A,
@@ -533,12 +558,45 @@ test("AT-26: a crash after the write leaves the queue replayable and the effect 
   assert.equal(claimed.length, 1);
   assert.equal(bridge.runtime.requestsTo("POST", "/events").length, 0, "nothing was sent yet");
 
-  // The dead worker's lease expires. The queue is not stranded and the intent is not lost: the
-  // pump takes it over under its own lease and sends it exactly once.
+  // The dead worker's lease expires. The pump must not treat `sent` as an ordinary retry: the
+  // Runtime may already have applied it, so the row first becomes ambiguous and leaves dispatch.
   bridge.advanceClock(5);
+  const pumpReport = await bridge.pump.pumpOnce([COMPANY_A]);
+  assert.equal(pumpReport.claimed, 0, "the expired sent effect is not blindly sent again");
+  assert.equal(bridge.store.countDeliveries(COMPANY_A, "ambiguous"), 1);
+  assert.equal(bridge.runtime.intake.length, 0, "the delivery pump did not resend the unknown outcome");
+
+  // Event intake has a Core-owned identity and is safe to retry. Only the reconciler moves this
+  // specific idempotent kind back to pending; the ordinary pump cannot make that decision.
+  const reconciliation = await bridge.company.reconciler.reconcileCompany(COMPANY_A);
+  assert.equal(reconciliation.ambiguousResolved, 1, JSON.stringify(reconciliation));
+  assert.equal(bridge.store.countDeliveries(COMPANY_A, "pending"), 1);
+  // The reconciler uses wall-clock scheduling while this harness uses a pinned clock. Make the
+  // now-authorized row due without sleeping, then exercise the normal delivery handler.
+  bridge.store.updateDelivery(COMPANY_A, effectKey, { nextAttemptAt: new Date(0).toISOString() });
   await bridge.pump.pumpOnce([COMPANY_A]);
   assert.equal(bridge.runtime.intake.length, 1);
   assert.equal(bridge.store.countDeliveries(COMPANY_A, "pending"), 0);
+});
+
+test("AT-26: an ambiguous event without its Core idempotency identity is never replayed", async () => {
+  const bridge = track(await withRun());
+  bridge.company.deliveries.begin({
+    effectKey: "corrupt-or-legacy-event-key",
+    kind: intents.INTENT_KINDS.eventIntake,
+    scope: { companyRef: COMPANY_A, projectRef: PROJECT_A },
+    correlationId: "corr-missing-id",
+    payload: { type: "pf.execution.observed", scope: { companyRef: COMPANY_A, projectRef: PROJECT_A } },
+  });
+  bridge.store.claimDueDeliveries({ companyId: COMPANY_A, owner: "worker-that-died", limit: 1, leaseMs: 1 });
+  bridge.advanceClock(5);
+  await bridge.pump.pumpOnce([COMPANY_A]);
+  const reconciliation = await bridge.company.reconciler.reconcileCompany(COMPANY_A);
+  assert.equal(reconciliation.ambiguousResolved, 0);
+  assert.equal(reconciliation.ambiguousStillUnknown, 1);
+  assert.equal(bridge.store.countDeliveries(COMPANY_A, "pending"), 0);
+  assert.equal(bridge.runtime.intake.length, 0);
+  assert.match(bridge.store.listDeliveries(COMPANY_A, ["ambiguous"])[0]?.lastError ?? "", /no matching source\/scope idempotency identity/);
 });
 
 test("AT-26: a crash after a settled write does not repeat the effect", async () => {

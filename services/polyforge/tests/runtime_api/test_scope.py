@@ -59,7 +59,7 @@ def admit_request(start_intent: str, *, graph: dict, scope: dict | None = None) 
         "rootIssueRef": {"provider": "paperclip", "kind": "issue", "id": f"issue-{start_intent}"},
         "inputSnapshot": {"requirement_baseline": {"id": "rb-1"}},
         "requiredFacts": {
-            "requirement_gate_passed": {
+            "requirement_acceptance": {
                 "source": "imp-1",
                 "sourceRevision": "rev-7",
                 "contentHash": "sha256:" + "ab" * 32,

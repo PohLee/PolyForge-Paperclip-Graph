@@ -20,10 +20,10 @@ const h = await load<typeof import("./helpers/harness.ts")>(new URL("./helpers/h
 
 const { COMPANY_A, PROJECT_A, buildBridge, company, project, issue, label } = h;
 const bridges: { dispose(): void }[] = [];
-after(() => {
-  for (const bridge of bridges) bridge.dispose();
+after(async () => {
+  for (const bridge of bridges) await bridge.dispose();
 });
-function track<T extends { dispose(): void }>(bridge: T): T {
+function track<T extends { dispose(): Promise<void> }>(bridge: T): T {
   bridges.push(bridge);
   return bridge;
 }
@@ -232,9 +232,176 @@ test("AT-14: the reconciler re-checks an expiry noticed between admission and co
   assert.match(String(payload["lastReason"]), /expired/i);
 });
 
-test("AT-14: a dispatch names one worker and asks the platform to wake it", async () => {
+test("AT-08/AT-14: dispatch asks Paperclip to wake the assigned worker; the plugin cannot invoke it", async () => {
   const bridge = track(await withApproval([]));
+  const { default: manifest } = await load<typeof import("../src/manifest.ts")>(
+    new URL("../src/manifest.ts", import.meta.url),
+  );
+  const capabilities = new Set(manifest.capabilities as string[]);
+  assert.equal(capabilities.has("agents.invoke"), false);
+  assert.equal(capabilities.has("agent.sessions.create"), false);
+
   // A work unit, already materialized on the child issue, and a worker that is allowed to run it.
+  bridge.store.putBinding({
+    companyId: COMPANY_A,
+    kind: "work_unit",
+    providerId: "run-1:n1:0",
+    projectId: PROJECT_A,
+    payload: {
+      runId: "run-1",
+      nodeId: "n1",
+      iteration: 0,
+      issueId: "child-1",
+      workspaceRequirement: { mode: "read_write", repositories: [], requireReadOnlyForReviewer: false },
+    },
+  });
+  h.seedChildIssue(bridge, "child-1");
+  h.seedCapabilityBinding(bridge, COMPANY_A, "agent:paperclip/agent-1", "agent-1");
+  const wakeupCalls: unknown[][] = [];
+  const requestWakeup = bridge.ctx.issues.requestWakeup.bind(bridge.ctx.issues);
+  bridge.ctx.issues.requestWakeup = async (...args) => {
+    wakeupCalls.push(args);
+    return requestWakeup(...args);
+  };
+
+  const receipt = await bridge.company.ports.work.assignAndWake(
+    {
+      scope: SCOPE,
+      runId: "run-1",
+      nodeId: "n1",
+      iteration: 0,
+      workUnitRef: { provider: "paperclip", kind: "issue", id: "child-1" },
+      workerSubjectRef: "agent:paperclip/agent-1",
+      attemptId: "attempt-1",
+    } as never,
+    META,
+  );
+  assert.equal(receipt.queued, true);
+  assert.ok(receipt.agentRunRef, "a wakeup must produce a run the bridge can bind");
+  assert.equal(wakeupCalls.length, 1, "the bridge uses Paperclip's scheduler API exactly once");
+  assert.deepEqual(wakeupCalls[0]?.slice(0, 2), ["child-1", COMPANY_A]);
+  assert.deepEqual(wakeupCalls[0]?.[2], {
+    reason: "PolyForge node n1 is READY (attempt attempt-1)",
+    contextSource: "polyforge",
+    idempotencyKey: META.idempotencyKey,
+    actorAgentId: null,
+    actorUserId: null,
+    actorRunId: null,
+  });
+  // The child issue is assigned, and the platform — not the bridge — decides whether to wake.
+  const child = await bridge.ctx.issues.get("child-1", COMPANY_A);
+  assert.equal(child?.assigneeAgentId, "agent-1");
+});
+
+test("AT-06: a repo-backed node is not assigned or woken without a verified isolated workspace", async () => {
+  const bridge = track(await withApproval([]));
+  bridge.store.putBinding({
+    companyId: COMPANY_A,
+    kind: "work_unit",
+    providerId: "run-1:n1:0",
+    projectId: PROJECT_A,
+    payload: {
+      runId: "run-1",
+      nodeId: "n1",
+      iteration: 0,
+      issueId: "child-1",
+      workspaceRequirement: {
+        mode: "read_write",
+        repositories: [{ repoRef: "https://example.invalid/repo.git", baseRef: "main", commit: "a".repeat(40) }],
+        requireReadOnlyForReviewer: false,
+      },
+    },
+  });
+  h.seedChildIssue(bridge, "child-1", {
+    currentExecutionWorkspace: {
+      companyId: COMPANY_A,
+      projectId: PROJECT_A,
+      status: "active",
+      mode: "shared_workspace",
+      providerType: "local_fs",
+      cwd: "/work/shared",
+    } as never,
+  });
+  h.seedCapabilityBinding(bridge, COMPANY_A, "agent:paperclip/agent-1", "agent-1");
+  let wakeupCount = 0;
+  const requestWakeup = bridge.ctx.issues.requestWakeup.bind(bridge.ctx.issues);
+  bridge.ctx.issues.requestWakeup = async (...args) => {
+    wakeupCount += 1;
+    return requestWakeup(...args);
+  };
+
+  const receipt = await bridge.company.ports.work.assignAndWake(
+    {
+      scope: SCOPE,
+      runId: "run-1",
+      nodeId: "n1",
+      iteration: 0,
+      workUnitRef: { provider: "paperclip", kind: "issue", id: "child-1" },
+      workerSubjectRef: "agent:paperclip/agent-1",
+      attemptId: "attempt-1",
+    } as never,
+    META,
+  );
+
+  assert.equal(receipt.queued, false);
+  assert.equal(receipt.reason, "verified_isolated_execution_workspace_and_commit_required");
+  assert.equal(wakeupCount, 0, "a shared workspace must not trigger an AgentRun");
+  const child = await bridge.ctx.issues.get("child-1", COMPANY_A);
+  assert.equal(child?.assigneeAgentId, null, "a blocked repo task must not be assigned");
+  const dispatch = bridge.store.getBinding(COMPANY_A, "dispatch", "run-1:n1:0");
+  assert.equal(dispatch, null, "a blocked repo task must not acquire an AgentRun binding");
+});
+
+test("AT-06: a repo-backed node reports an unrealized workspace without assigning or waking", async () => {
+  const bridge = track(await withApproval([]));
+  bridge.store.putBinding({
+    companyId: COMPANY_A,
+    kind: "work_unit",
+    providerId: "run-1:n1:0",
+    projectId: PROJECT_A,
+    payload: {
+      runId: "run-1",
+      nodeId: "n1",
+      iteration: 0,
+      issueId: "child-1",
+      workspaceRequirement: {
+        mode: "read_write",
+        repositories: [{ repoRef: "https://example.invalid/repo.git", baseRef: "main", commit: "a".repeat(40) }],
+        requireReadOnlyForReviewer: false,
+      },
+    },
+  });
+  h.seedChildIssue(bridge, "child-1");
+  h.seedCapabilityBinding(bridge, COMPANY_A, "agent:paperclip/agent-1", "agent-1");
+  let wakeupCount = 0;
+  const requestWakeup = bridge.ctx.issues.requestWakeup.bind(bridge.ctx.issues);
+  bridge.ctx.issues.requestWakeup = async (...args) => {
+    wakeupCount += 1;
+    return requestWakeup(...args);
+  };
+
+  const receipt = await bridge.company.ports.work.assignAndWake(
+    {
+      scope: SCOPE,
+      runId: "run-1",
+      nodeId: "n1",
+      iteration: 0,
+      workUnitRef: { provider: "paperclip", kind: "issue", id: "child-1" },
+      workerSubjectRef: "agent:paperclip/agent-1",
+      attemptId: "attempt-1",
+    } as never,
+    META,
+  );
+
+  assert.equal(receipt.queued, false);
+  assert.equal(receipt.reason, "execution_workspace_not_realized");
+  assert.equal(wakeupCount, 0, "an unrealized workspace must not trigger an AgentRun");
+  const child = await bridge.ctx.issues.get("child-1", COMPANY_A);
+  assert.equal(child?.assigneeAgentId, null, "a blocked repo task must not be assigned");
+});
+
+test("AT-06: a dispatch with a missing workspace contract remains blocked", async () => {
+  const bridge = track(await withApproval([]));
   bridge.store.putBinding({
     companyId: COMPANY_A,
     kind: "work_unit",
@@ -257,9 +424,175 @@ test("AT-14: a dispatch names one worker and asks the platform to wake it", asyn
     } as never,
     META,
   );
+
+  assert.equal(receipt.queued, false);
+  assert.equal(receipt.reason, "workspace_requirement_unavailable");
+  const child = await bridge.ctx.issues.get("child-1", COMPANY_A);
+  assert.equal(child?.assigneeAgentId, null);
+});
+
+test("AT-06: code.modify cannot bypass the workspace gate with an empty repository list", async () => {
+  const bridge = track(await withApproval([]));
+  bridge.store.putBinding({
+    companyId: COMPANY_A,
+    kind: "work_unit",
+    providerId: "run-1:n1:0",
+    projectId: PROJECT_A,
+    payload: {
+      runId: "run-1",
+      nodeId: "n1",
+      iteration: 0,
+      issueId: "child-1",
+      requiredCapabilities: ["code.modify"],
+      workspaceRequirement: { mode: "read_write", repositories: [], requireReadOnlyForReviewer: false },
+    },
+  });
+  h.seedChildIssue(bridge, "child-1");
+  h.seedCapabilityBinding(bridge, COMPANY_A, "agent:paperclip/agent-1", "agent-1");
+
+  const receipt = await bridge.company.ports.work.assignAndWake(
+    {
+      scope: SCOPE,
+      runId: "run-1",
+      nodeId: "n1",
+      iteration: 0,
+      workUnitRef: { provider: "paperclip", kind: "issue", id: "child-1" },
+      workerSubjectRef: "agent:paperclip/agent-1",
+      attemptId: "attempt-1",
+    } as never,
+    META,
+  );
+
+  assert.equal(receipt.queued, false);
+  assert.equal(receipt.reason, "repo_workspace_requirement_missing_for_code_modify");
+  const child = await bridge.ctx.issues.get("child-1", COMPANY_A);
+  assert.equal(child?.assigneeAgentId, null);
+});
+
+test("AT-06: an isolated workspace at the wrong commit is not dispatched", async () => {
+  const bridge = track(await withApproval([]));
+  bridge.store.putBinding({
+    companyId: COMPANY_A,
+    kind: "work_unit",
+    providerId: "run-1:n1:0",
+    projectId: PROJECT_A,
+    payload: {
+      runId: "run-1",
+      nodeId: "n1",
+      iteration: 0,
+      issueId: "child-1",
+      workspaceRequirement: {
+        mode: "read_write",
+        repositories: [{ repoRef: "https://example.invalid/repo.git", baseRef: "main", commit: "a".repeat(40) }],
+        requireReadOnlyForReviewer: false,
+      },
+    },
+  });
+  h.seedChildIssue(bridge, "child-1", {
+    currentExecutionWorkspace: {
+      id: "execution-workspace-1",
+      companyId: COMPANY_A,
+      projectId: PROJECT_A,
+      status: "active",
+      mode: "isolated_workspace",
+      providerType: "git_worktree",
+      cwd: "/work/isolated",
+    } as never,
+  });
+  bridge.ctx.executionWorkspaces.get = async () => ({
+    id: "execution-workspace-1",
+    companyId: COMPANY_A,
+    projectId: PROJECT_A,
+    projectWorkspaceId: "project-workspace-1",
+    path: "/work/isolated",
+    cwd: "/work/isolated",
+    repoUrl: "https://example.invalid/repo.git",
+    baseRef: "main",
+    branchName: "polyforge/run-1",
+    providerType: "git_worktree",
+    providerMetadata: { repoRef: "https://example.invalid/repo.git", commit: "b".repeat(40) },
+  });
+  h.seedCapabilityBinding(bridge, COMPANY_A, "agent:paperclip/agent-1", "agent-1");
+
+  const receipt = await bridge.company.ports.work.assignAndWake(
+    {
+      scope: SCOPE,
+      runId: "run-1",
+      nodeId: "n1",
+      iteration: 0,
+      workUnitRef: { provider: "paperclip", kind: "issue", id: "child-1" },
+      workerSubjectRef: "agent:paperclip/agent-1",
+      attemptId: "attempt-1",
+    } as never,
+    META,
+  );
+
+  assert.equal(receipt.queued, false);
+  assert.equal(receipt.reason, "verified_isolated_execution_workspace_and_commit_required");
+  const child = await bridge.ctx.issues.get("child-1", COMPANY_A);
+  assert.equal(child?.assigneeAgentId, null, "a mismatched commit must not be assigned");
+});
+
+test("AT-06: matching isolated workspace and pinned commit can dispatch a repo task", async () => {
+  const bridge = track(await withApproval([]));
+  bridge.store.putBinding({
+    companyId: COMPANY_A,
+    kind: "work_unit",
+    providerId: "run-1:n1:0",
+    projectId: PROJECT_A,
+    payload: {
+      runId: "run-1",
+      nodeId: "n1",
+      iteration: 0,
+      issueId: "child-1",
+      workspaceRequirement: {
+        mode: "read_write",
+        repositories: [{ repoRef: "https://example.invalid/repo.git", baseRef: "main", commit: "a".repeat(40) }],
+        requireReadOnlyForReviewer: false,
+      },
+    },
+  });
+  h.seedChildIssue(bridge, "child-1", {
+    currentExecutionWorkspace: {
+      id: "execution-workspace-1",
+      companyId: COMPANY_A,
+      projectId: PROJECT_A,
+      status: "active",
+      mode: "isolated_workspace",
+      providerType: "git_worktree",
+      cwd: "/work/isolated",
+    } as never,
+  });
+  bridge.ctx.executionWorkspaces.get = async () => ({
+    id: "execution-workspace-1",
+    companyId: COMPANY_A,
+    projectId: PROJECT_A,
+    projectWorkspaceId: "project-workspace-1",
+    path: "/work/isolated",
+    cwd: "/work/isolated",
+    repoUrl: "https://example.invalid/repo.git",
+    baseRef: "main",
+    branchName: "polyforge/run-1",
+    providerType: "git_worktree",
+    providerMetadata: { repoRef: "https://example.invalid/repo.git", git: { headCommit: "a".repeat(40) } },
+  });
+  h.seedCapabilityBinding(bridge, COMPANY_A, "agent:paperclip/agent-1", "agent-1");
+
+  const receipt = await bridge.company.ports.work.assignAndWake(
+    {
+      scope: SCOPE,
+      runId: "run-1",
+      nodeId: "n1",
+      iteration: 0,
+      workUnitRef: { provider: "paperclip", kind: "issue", id: "child-1" },
+      workerSubjectRef: "agent:paperclip/agent-1",
+      attemptId: "attempt-1",
+    } as never,
+    META,
+  );
+
   assert.equal(receipt.queued, true);
-  assert.ok(receipt.agentRunRef, "a wakeup must produce a run the bridge can bind");
-  // The child issue is assigned, and the platform — not the bridge — decides whether to wake.
+  assert.ok(receipt.agentRunRef, "the pinned isolated workspace may be dispatched");
   const child = await bridge.ctx.issues.get("child-1", COMPANY_A);
   assert.equal(child?.assigneeAgentId, "agent-1");
 });

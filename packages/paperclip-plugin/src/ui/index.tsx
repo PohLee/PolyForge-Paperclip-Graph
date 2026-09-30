@@ -48,7 +48,7 @@ export function PolyForgePage(_props: PluginPageProps): ReactElement {
 
 /** Slot `sidebar` / `polyforge-nav` — manifest `exportName: "PolyForgeSidebar"`. */
 export function PolyForgeSidebar(_props: PluginSidebarProps): ReactElement {
-  return <SidebarEntry />;
+  return <SidebarEntry pluginId={(_props as PluginSidebarProps & { slot: { pluginId: string } }).slot.pluginId} />;
 }
 
 /** Slot `dashboardWidget` / `polyforge-health` — manifest `exportName: "PolyForgeHealthWidget"`. */

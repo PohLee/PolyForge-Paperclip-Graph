@@ -35,6 +35,7 @@ Invariants (``docs/05-PROTOCOL.md`` sections 5-8, ``docs/02-TECHNICAL-PLAN.md`` 
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Any, Mapping, Sequence
 
 from polyforge import COMPILER_VERSION, PROTOCOL_VERSION, SCHEMA_VERSION
@@ -59,6 +60,7 @@ from polyforge.core.runtime.planner import (
     ExecutionPlan,
     PlanNode,
     build_plan,
+    compute_plan_hash,
     plan_states,
 )
 from polyforge.core.state import (
@@ -1088,6 +1090,8 @@ class RuntimeEngine:
                 "rootIssueRef": dict(root_issue_ref),
                 "inputSnapshot": dict(request.get("inputSnapshot") or {}),
                 "requiredFacts": dict(request.get("requiredFacts") or {}),
+                "requiredFactSources": dict(request.get("requiredFactSources") or {}),
+                "workspaceRequirement": request.get("workspaceRequirement"),
             },
         )
         existing = self.db.query_one(
@@ -1126,6 +1130,18 @@ class RuntimeEngine:
         plan = build_plan(
             definition, graph_version=graph_version, entrypoint=entrypoint, artifact=artifact
         )
+        plan = self._apply_run_workspace_requirement(plan, request.get("workspaceRequirement"))
+        required_facts = self._resolve_required_fact_sources(
+            scope, plan, request.get("requiredFactSources")
+        )
+        admission_request = dict(request)
+        if required_facts:
+            # Caller-supplied hashes are never mixed with Core-resolved gate receipts.
+            if request.get("requiredFacts"):
+                raise errors.contract_invalid(
+                    "requiredFacts cannot be combined with Core-resolved requiredFactSources"
+                )
+            admission_request["requiredFacts"] = required_facts
 
         rules = self._definition_policy_rules(definition, request)
         if not rules:
@@ -1165,7 +1181,7 @@ class RuntimeEngine:
                 "supplied; the Core will not infer an approval from silence",
                 blockers=[admission_policy.to_wire()],
             )
-        missing_facts = self._missing_required_facts(plan, request)
+        missing_facts = self._missing_required_facts(plan, admission_request)
         if missing_facts:
             raise errors.contract_invalid(
                 "the entry point requires prerequisite facts with verifiable provenance: "
@@ -1174,7 +1190,7 @@ class RuntimeEngine:
                 suppliedFacts=sorted((request.get("requiredFacts") or {}).keys()),
             )
         blockers = self._sibling_admission_blockers(
-            definition, plan, entrypoint, request, self._capability_bindings(scope)
+            definition, plan, entrypoint, admission_request, self._capability_bindings(scope)
         )
         if blockers:
             raise errors.contract_invalid(
@@ -1221,7 +1237,9 @@ class RuntimeEngine:
                 else None,
                 "root_issue_ref_json": dumps(dict(root_issue_ref)),
                 "input_snapshot_json": dumps(dict(request.get("inputSnapshot") or {})),
-                "required_facts_json": dumps(dict(request.get("requiredFacts") or {})),
+                "required_facts_json": dumps(
+                    required_facts or dict(request.get("requiredFacts") or {})
+                ),
                 "case_binding_json": dumps(dict(request["caseBinding"]))
                 if request.get("caseBinding")
                 else None,
@@ -1265,7 +1283,9 @@ class RuntimeEngine:
                 "pins_json": dumps(pins),
                 "plan_json": dumps(plan.to_wire()),
                 "input_snapshot_json": dumps(dict(request.get("inputSnapshot") or {})),
-                "required_facts_json": dumps(dict(request.get("requiredFacts") or {})),
+                "required_facts_json": dumps(
+                    required_facts or dict(request.get("requiredFacts") or {})
+                ),
                 "root_issue_ref_json": dumps(dict(root_issue_ref)),
                 "parent_issue_ref_json": dumps(dict(request["parentIssueRef"]))
                 if request.get("parentIssueRef")
@@ -1762,6 +1782,76 @@ class RuntimeEngine:
         }
 
     @staticmethod
+    def _apply_run_workspace_requirement(
+        plan: ExecutionPlan,
+        raw_requirement: Any,
+    ) -> ExecutionPlan:
+        """Pin a board-authored repository commit into this run's code.modify plan nodes.
+
+        Paperclip remains the provider and owns workspace creation. The Core records the exact
+        repo/ref/commit in the run-specific plan, so later node intents and dispatch checks use
+        the same immutable source. A graph cannot turn this input into code authority: only
+        nodes already declared as code.modify receive it.
+        """
+        code_nodes = [
+            node for node in plan.nodes.values()
+            if "code.modify" in node.required_capabilities or node.operation.get("id") == "code.modify"
+        ]
+        if raw_requirement is None:
+            if code_nodes:
+                raise errors.contract_invalid(
+                    "this graph has code.modify nodes and admission did not carry a verified workspace requirement",
+                    graphId=plan.graph_id,
+                    nodes=sorted(node.node_id for node in code_nodes),
+                )
+            return plan
+        if not code_nodes:
+            raise errors.contract_invalid(
+                "workspaceRequirement was supplied, but this run has no code.modify node to receive it",
+                graphId=plan.graph_id,
+            )
+        if not isinstance(raw_requirement, Mapping) or set(raw_requirement) != {
+            "mode", "repositories", "requireReadOnlyForReviewer"
+        }:
+            raise errors.contract_invalid("workspaceRequirement must use the exact supported schema")
+        repositories = raw_requirement.get("repositories")
+        if (
+            raw_requirement.get("mode") != "read_write"
+            or raw_requirement.get("requireReadOnlyForReviewer") is not False
+            or not isinstance(repositories, list)
+            or len(repositories) != 1
+            or not isinstance(repositories[0], Mapping)
+            or set(repositories[0]) != {"repoRef", "baseRef", "commit"}
+        ):
+            raise errors.contract_invalid(
+                "Phase 0–4 code execution supports exactly one writable repository with an exact commit pin"
+            )
+        repo = repositories[0]
+        repo_ref, base_ref, commit = repo.get("repoRef"), repo.get("baseRef"), repo.get("commit")
+        if (
+            not isinstance(repo_ref, str) or not repo_ref.strip()
+            or not isinstance(base_ref, str) or not base_ref.strip()
+            or not isinstance(commit, str) or len(commit) not in (40, 64)
+            or any(character not in "0123456789abcdefABCDEF" for character in commit)
+        ):
+            raise errors.contract_invalid("workspaceRequirement commit must be a full Git object ID")
+        requirement = {
+            "mode": "read_write",
+            "repositories": [{"repoRef": repo_ref, "baseRef": base_ref, "commit": commit.lower()}],
+            "requireReadOnlyForReviewer": False,
+        }
+        nodes = dict(plan.nodes)
+        for node in code_nodes:
+            if node.workspace_requirement is not None and dict(node.workspace_requirement) != requirement:
+                raise errors.contract_invalid(
+                    "the run workspace pin conflicts with a code.modify node's published workspace requirement",
+                    nodeId=node.node_id,
+                )
+            nodes[node.node_id] = replace(node, workspace_requirement=requirement)
+        candidate = replace(plan, nodes=nodes, plan_hash="")
+        return replace(candidate, plan_hash=compute_plan_hash(candidate))
+
+    @staticmethod
     def _missing_required_facts(plan: ExecutionPlan, request: Mapping[str, Any]) -> list[str]:
         supplied = request.get("requiredFacts") or {}
         missing: list[str] = []
@@ -1779,6 +1869,116 @@ class RuntimeEngine:
                     f"fact {fact!r} lacks verifiable provenance (source, sourceRevision, contentHash)"
                 )
         return missing
+
+    def _resolve_required_fact_sources(
+        self,
+        scope: Scope,
+        plan: ExecutionPlan,
+        raw_sources: Any,
+    ) -> dict[str, dict[str, str]]:
+        """Resolve imported prerequisites from completed, same-scope GraphRun gate exports.
+
+        A source Run ID is only a selector, never proof by itself. The Core verifies the exact
+        run scope and terminal state, the immutable source plan's export contract, and the
+        currently-passed gate execution before deriving provenance hashes to pin on the new run.
+        """
+        if raw_sources is None:
+            return {}
+        if not isinstance(raw_sources, Mapping):
+            raise errors.contract_invalid("requiredFactSources must be an object keyed by fact name")
+        if not plan.required_facts:
+            raise errors.contract_invalid(
+                "requiredFactSources were supplied for an entrypoint with no required facts"
+            )
+        supplied_names = {str(name) for name in raw_sources}
+        required_names = set(plan.required_facts)
+        if supplied_names != required_names:
+            raise errors.contract_invalid(
+                "requiredFactSources must name exactly the entrypoint's required facts",
+                requiredFacts=sorted(required_names),
+                suppliedFacts=sorted(supplied_names),
+            )
+
+        resolved: dict[str, dict[str, str]] = {}
+        for fact_name in sorted(required_names):
+            source = raw_sources.get(fact_name)
+            if (
+                not isinstance(source, Mapping)
+                or set(source) != {"sourceRunId"}
+                or not isinstance(source.get("sourceRunId"), str)
+                or not str(source.get("sourceRunId", "")).strip()
+            ):
+                raise errors.contract_invalid(
+                    "each required fact source must contain only a non-empty sourceRunId",
+                    fact=fact_name,
+                )
+            source_run_id = str(source["sourceRunId"])
+            source_run = self.db.query_one(
+                "SELECT * FROM graph_runs WHERE run_id = ? AND company_ref = ? AND project_ref = ?",
+                (source_run_id, scope.company_ref, scope.project_ref),
+            )
+            if source_run is None:
+                raise errors.contract_invalid(
+                    "required fact source must be a visible GraphRun in the same company and project",
+                    fact=fact_name,
+                )
+            if str(source_run["status"]) != GraphRunStatus.COMPLETED:
+                raise errors.contract_invalid(
+                    "required fact source GraphRun must be COMPLETED",
+                    fact=fact_name,
+                    sourceRunId=source_run_id,
+                    sourceStatus=str(source_run["status"]),
+                )
+            source_plan = self._plan(source_run)
+            if fact_name not in source_plan.export_kinds:
+                raise errors.contract_invalid(
+                    "required fact is not an export of the source GraphRun's pinned plan",
+                    fact=fact_name,
+                    sourceRunId=source_run_id,
+                    sourceGraphId=source_plan.graph_id,
+                )
+            gates = [
+                node for node in source_plan.nodes.values()
+                if node.is_gate and fact_name in node.produces
+            ]
+            if len(gates) != 1:
+                raise errors.contract_invalid(
+                    "required fact must be produced by exactly one gate in the source GraphRun",
+                    fact=fact_name,
+                    sourceRunId=source_run_id,
+                    gateCount=len(gates),
+                )
+            gate = gates[0]
+            gate_row = self.db.query_one(
+                "SELECT status, iteration, output_digest FROM node_executions"
+                " WHERE run_id = ? AND node_id = ? ORDER BY iteration DESC LIMIT 1",
+                (source_run_id, gate.node_id),
+            )
+            if gate_row is None or str(gate_row["status"]) != NodeStatus.PASSED:
+                raise errors.contract_invalid(
+                    "required fact source gate is not currently PASSED",
+                    fact=fact_name,
+                    sourceRunId=source_run_id,
+                    gateId=gate.node_id,
+                )
+            content_hash = str(gate_row["output_digest"] or "")
+            if (
+                len(content_hash) != 71
+                or not content_hash.startswith("sha256:")
+                or any(character not in "0123456789abcdef" for character in content_hash[7:])
+            ):
+                raise errors.contract_invalid(
+                    "required fact source gate has no valid Core output digest",
+                    fact=fact_name,
+                    sourceRunId=source_run_id,
+                    gateId=gate.node_id,
+                )
+            resolved[fact_name] = {
+                "source": f"graph-run:{source_run_id}#{gate.node_id}",
+                "sourceRevision": f"{source_run['plan_hash']}@{source_run['state_version']}",
+                "contentHash": content_hash,
+            }
+        return resolved
 
     def _capability_bindings(self, scope: Scope) -> list[dict[str, Any]]:
         """The governed capability bindings that exist in this scope.
@@ -1804,6 +2004,23 @@ class RuntimeEngine:
             )
             entry["capabilities"].append(str(row["capability_ref"]))
         return [by_subject[key] for key in sorted(by_subject)]
+
+    def capability_subjects(
+        self, scope: Scope, required_capabilities: Sequence[str]
+    ) -> list[str]:
+        """Project-scoped subjects holding every capability in ``required_capabilities``.
+
+        The Runtime exposes this read to admission so the bridge can pin node policies from
+        the same governed capability records the Core uses to dispatch and claim work.
+        """
+        required = set(required_capabilities)
+        if not required:
+            return []
+        return sorted(
+            str(binding["subjectRef"])
+            for binding in self._capability_bindings(scope)
+            if required.issubset(set(binding.get("capabilities") or ()))
+        )
 
     @staticmethod
     def _sibling_admission_blockers(
@@ -2036,6 +2253,14 @@ class RuntimeEngine:
             raise
 
     def _claim_tx(self, scope: Scope, request: Mapping[str, Any]) -> dict[str, Any]:
+        raw_epoch = request.get("leaseEpoch")
+        if raw_epoch is not None and (isinstance(raw_epoch, bool) or not isinstance(raw_epoch, int)):
+            raise errors.bad_request("leaseEpoch must be an integer", field="leaseEpoch")
+        if request.get("attemptId") not in (None, ""):
+            raise errors.contract_invalid(
+                "attemptId is allocated by Core and may not be supplied by a caller",
+                field="attemptId",
+            )
         run = self._load_run_in_scope(str(request.get("runId", "")), scope, operation="claim")
         run_id = str(run["run_id"])
         if str(run["status"]) in _TERMINAL_RUN:
@@ -2109,7 +2334,7 @@ class RuntimeEngine:
                 runId=run_id,
             )
 
-        presented_epoch = request.get("leaseEpoch")
+        presented_epoch = raw_epoch
         existing = self._active_claim(run_id, node_id, iteration)
         now = self._now()
         if existing is not None:
@@ -2120,14 +2345,15 @@ class RuntimeEngine:
                 # Create-or-verify: the same worker re-claiming its own live lease is a no-op.
                 return ExecutionAttempt.from_row(existing).to_wire()
             required_epoch = existing_epoch + 1
-            if presented_epoch is None or int(presented_epoch) < required_epoch:
+            if presented_epoch is None or int(presented_epoch) != required_epoch:
                 raise errors.lease_fenced(
                     f"node {node_id!r} is already claimed at epoch {existing_epoch}; a takeover must "
-                    f"present an epoch of at least {required_epoch}",
+                    f"present exactly the next epoch {required_epoch}",
                     nodeId=node_id,
                     runId=run_id,
                     presentedEpoch=int(presented_epoch) if presented_epoch is not None else None,
                     activeEpoch=existing_epoch,
+                    requiredEpoch=required_epoch,
                     attemptId=str(existing["attempt_id"]),
                     holderSubject=str(existing["agent_subject"] or ""),
                 )
@@ -2167,8 +2393,16 @@ class RuntimeEngine:
             (run_id, node_id, iteration),
         )
         attempt_no = int(attempt_row["attempt_no"]) + 1
+        if existing is None and presented_epoch is not None and int(presented_epoch) != attempt_no:
+            raise errors.lease_fenced(
+                f"node {node_id!r} expects initial lease epoch {attempt_no}, not {presented_epoch}",
+                nodeId=node_id,
+                runId=run_id,
+                presentedEpoch=int(presented_epoch),
+                requiredEpoch=attempt_no,
+            )
         epoch = int(presented_epoch) if presented_epoch is not None else attempt_no
-        attempt_id = str(request.get("attemptId") or ids.new_id("attempt"))
+        attempt_id = ids.new_id("attempt")
         issue_ref = dumps(dict(request["issueRef"])) if request.get("issueRef") else None
         self.db.execute(
             "INSERT INTO execution_attempts (attempt_id, company_ref, project_ref, run_id, node_id,"

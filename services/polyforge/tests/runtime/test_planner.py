@@ -189,7 +189,7 @@ class JoinTests(unittest.TestCase):
         )
         return decisions["merge"].status
 
-    def test_all_join_needs_every_upstream(self) -> None:
+    def test_AT_05_all_join_needs_every_upstream(self) -> None:
         self.assertEqual(self._merge("all"), NodeStatus.READY)
         self.assertEqual(
             self._merge(
@@ -198,7 +198,7 @@ class JoinTests(unittest.TestCase):
             NodeStatus.PENDING,
         )
 
-    def test_any_join_needs_only_one_upstream(self) -> None:
+    def test_AT_05_any_join_needs_only_one_upstream(self) -> None:
         self.assertEqual(
             self._merge(
                 "any", statuses={"left": "PASSED", "right": "PENDING", "merge": "PENDING", "orphan": "PENDING"}
@@ -206,7 +206,7 @@ class JoinTests(unittest.TestCase):
             NodeStatus.READY,
         )
 
-    def test_quorum_join_needs_its_count(self) -> None:
+    def test_AT_05_quorum_join_needs_its_count(self) -> None:
         self.assertEqual(self._merge("quorum", quorum=2), NodeStatus.READY)
         self.assertEqual(
             self._merge(
@@ -217,7 +217,7 @@ class JoinTests(unittest.TestCase):
             NodeStatus.PENDING,
         )
 
-    def test_a_failed_upstream_never_satisfies_a_join(self) -> None:
+    def test_AT_05_a_failed_upstream_never_satisfies_a_join(self) -> None:
         for semantics in ("all", "any", "quorum"):
             with self.subTest(semantics=semantics):
                 self.assertEqual(
@@ -234,7 +234,7 @@ class JoinTests(unittest.TestCase):
                     NodeStatus.BLOCKED,
                 )
 
-    def test_a_skipped_upstream_propagates_under_an_all_join(self) -> None:
+    def test_AT_05_a_skipped_upstream_propagates_under_an_all_join(self) -> None:
         self.assertEqual(
             self._merge(
                 "all",
@@ -243,7 +243,7 @@ class JoinTests(unittest.TestCase):
             NodeStatus.SKIPPED,
         )
 
-    def test_a_skipped_upstream_does_not_block_an_any_join_with_a_passed_one(self) -> None:
+    def test_AT_05_a_skipped_upstream_does_not_block_an_any_join_with_a_passed_one(self) -> None:
         self.assertEqual(
             self._merge(
                 "any",
@@ -254,20 +254,20 @@ class JoinTests(unittest.TestCase):
 
 
 class GuardTests(unittest.TestCase):
-    def test_a_guard_over_a_missing_fact_is_undecided_not_false(self) -> None:
+    def test_AT_05_a_guard_over_a_missing_fact_is_undecided_not_false(self) -> None:
         state, reason = evaluate_guard({"fact": "risk", "equals": "high"}, {})
         self.assertEqual(state, "unknown")
         self.assertIn("has not been produced", reason)
 
-    def test_a_false_guard_skips_the_branch(self) -> None:
+    def test_AT_05_a_false_guard_skips_the_branch(self) -> None:
         state, _ = evaluate_guard({"fact": "risk", "equals": "high"}, {"risk": "low"})
         self.assertEqual(state, "fails")
 
-    def test_a_true_guard_holds(self) -> None:
+    def test_AT_05_a_true_guard_holds(self) -> None:
         state, _ = evaluate_guard({"fact": "risk", "equals": "high"}, {"risk": "high"})
         self.assertEqual(state, "holds")
 
-    def test_a_guard_that_selects_a_branch_out_marks_the_node_skipped(self) -> None:
+    def test_AT_05_a_guard_that_selects_a_branch_out_marks_the_node_skipped(self) -> None:
         graph = _diamond()
         graph["nodes"]["left"]["guard"] = {"fact": "enabled", "equals": True}
         plan = build_plan(graph, entrypoint="start")
@@ -280,7 +280,7 @@ class GuardTests(unittest.TestCase):
         self.assertEqual(decisions["left"].status, NodeStatus.SKIPPED)
         self.assertIn("selects this branch out", decisions["left"].reason)
 
-    def test_an_undecided_guard_holds_the_node_pending(self) -> None:
+    def test_AT_05_an_undecided_guard_holds_the_node_pending(self) -> None:
         graph = _diamond()
         graph["nodes"]["left"]["guard"] = {"fact": "enabled", "equals": True}
         plan = build_plan(graph, entrypoint="start")
@@ -371,25 +371,25 @@ class ChildSubgraphTests(unittest.TestCase):
             child_runs={"child-run-1": child} if child else {},
         )["child"]
 
-    def test_a_missing_child_run_holds_the_parent(self) -> None:
+    def test_AT_05_a_missing_child_run_holds_the_parent(self) -> None:
         decision = self._decide(None)
         self.assertEqual(decision.status, NodeStatus.PENDING)
         self.assertIn("has not been created", decision.reason)
 
-    def test_a_running_child_holds_the_parent(self) -> None:
+    def test_AT_05_a_running_child_holds_the_parent(self) -> None:
         decision = self._decide({"status": "ACTIVE", "exports": []})
         self.assertEqual(decision.status, NodeStatus.PENDING)
 
-    def test_a_completed_child_without_verified_exports_holds_the_parent(self) -> None:
+    def test_AT_05_a_completed_child_without_verified_exports_holds_the_parent(self) -> None:
         decision = self._decide({"status": "COMPLETED", "exports": []})
         self.assertEqual(decision.status, NodeStatus.PENDING)
         self.assertIn("verified export", decision.reason)
 
-    def test_a_completed_child_with_verified_exports_releases_the_parent(self) -> None:
+    def test_AT_05_a_completed_child_with_verified_exports_releases_the_parent(self) -> None:
         decision = self._decide({"status": "COMPLETED", "exports": ["child_result"]})
         self.assertEqual(decision.status, NodeStatus.READY)
 
-    def test_a_failed_child_blocks_the_parent(self) -> None:
+    def test_AT_05_a_failed_child_blocks_the_parent(self) -> None:
         decision = self._decide({"status": "FAILED", "exports": []})
         self.assertEqual(decision.status, NodeStatus.BLOCKED)
         self.assertIn("never passes on a worker exit alone", decision.reason)

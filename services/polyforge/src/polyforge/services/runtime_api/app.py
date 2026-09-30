@@ -49,6 +49,7 @@ from polyforge.core.errors import ErrorCode, PolyForgeError
 from polyforge.core.registry.store import RegistryStore
 from polyforge.core.runtime.engine import RuntimeEngine
 from polyforge.core.store.db import Database
+from polyforge.core.store.models import Scope
 from polyforge.services.runtime_api import errors as apierrors
 from polyforge.services.runtime_api.auth import AuthContext, RequestAuthenticator
 from polyforge.services.runtime_api.config import ServiceConfig
@@ -91,7 +92,7 @@ _SCOPE_BODY_FIELDS: Final[tuple[str, ...]] = ("companyRef", "projectRef", "compa
 #: Handlers whose Core method reads ``actor``. Kept beside :meth:`RuntimeService._payload` so
 #: the two cannot drift: omitting a name silently strips an identity a Core method needs.
 _ACTOR_READING_ENDPOINTS: Final[frozenset[str]] = frozenset(
-    {"run_command", "current_contract", "adopt_current"}
+    {"run_command", "current_contract"}
 )
 
 #: Platform roles mapped onto Core capabilities. The platform asserted these roles at hop one;
@@ -1024,10 +1025,42 @@ class RuntimeService:
             active = self.registry.get_active_version(scope=ctx.scope, graph_id=graph_id)
             versions = self.registry.list_versions(graph_id, scope=ctx.scope)
             entrypoints: dict[str, Any] = {}
+            node_policies: list[dict[str, Any]] = []
             if active is not None:
                 declared = active.definition.get("entrypoints")
                 if isinstance(declared, Mapping):
                     entrypoints = dict(declared)
+                declared_nodes = active.definition.get("nodes")
+                if isinstance(declared_nodes, Mapping):
+                    for node_id, node in sorted(declared_nodes.items()):
+                        if not isinstance(node_id, str) or not isinstance(node, Mapping):
+                            continue
+                        if node.get("kind") != "agent_operation":
+                            continue
+                        executor = node.get("executor")
+                        capabilities = (
+                            executor.get("requiredCapabilities")
+                            if isinstance(executor, Mapping)
+                            else None
+                        )
+                        node_policies.append(
+                            {
+                                "nodeId": node_id,
+                                "requiredCapabilities": [
+                                    str(capability)
+                                    for capability in capabilities or ()
+                                    if isinstance(capability, str) and capability
+                                ],
+                                "eligibleSubjects": self.engine.capability_subjects(
+                                    Scope.from_wire(ctx.scope),
+                                    [
+                                        str(capability)
+                                        for capability in capabilities or ()
+                                        if isinstance(capability, str) and capability
+                                    ],
+                                ),
+                            }
+                        )
             graphs.append(
                 {
                     "graphId": graph_id,
@@ -1035,6 +1068,10 @@ class RuntimeService:
                     "versionCount": len(versions),
                     "isActive": active is not None,
                     "entrypoints": entrypoints,
+                    # Admission uses this active-version projection to pin narrowly scoped
+                    # node-execution policy from the bridge's separately governed capability
+                    # bindings. It intentionally exposes no draft or inactive graph content.
+                    "nodePolicies": node_policies,
                     "name": active.definition.get("name", graph_id) if active is not None else graph_id,
                     "description": active.definition.get("description", "") if active is not None else "",
                 }
@@ -1298,37 +1335,17 @@ class RuntimeService:
 
     def _handle_current_contract(self, ctx: HandlerContext) -> HandlerResult:
         """The current contract and permitted actions for the asserted actor. Read only."""
-        return Response.json_body(200, self._current_view(ctx, adopt=False))
+        if ctx.request.query_one("adopt") is not None or ctx.request.query_one("priorWorkerState") is not None:
+            raise errors.bad_request(
+                "GET /current is read-only; use the operator-only POST route for an explicit takeover"
+            )
+        return Response.json_body(200, self._current_view(ctx))
 
-    def _handle_adopt_current(self, ctx: HandlerContext) -> HandlerResult:
-        """The same view, plus a controlled takeover at a new lease epoch.
-
-        The takeover takes the platform's confirmation about the previous worker from the body,
-        because that is a statement about another system and belongs in a request, not in a URL.
-        The Core still refuses a takeover until the prior worker is confirmed stopped or fenced;
-        this route does not weaken that, it only gives the confirmation somewhere to live.
-        """
-        adopt = ctx.body.get("adopt", True)
-        if not isinstance(adopt, bool):
-            raise errors.bad_request("adopt must be a boolean", field="adopt")
-        return Response.json_body(200, self._current_view(ctx, adopt=adopt))
-
-    def _current_view(self, ctx: HandlerContext, *, adopt: bool) -> dict[str, Any]:
-        actor = ctx.actor_view()
-        prior = ctx.body.get("priorWorkerState") or ctx.request.query_one("priorWorkerState")
-        if prior:
-            actor["priorWorkerState"] = str(prior)
-        if adopt:
-            actor["commandId"] = ctx.body.get("commandId") or f"adopt:{ctx.params['runId']}"
-        if ctx.body.get("leaseEpoch") is not None:
-            actor["leaseEpoch"] = _body_int(ctx.body["leaseEpoch"], "leaseEpoch")
-        if ctx.body.get("agentRunRef") is not None:
-            actor["agentRunRef"] = ctx.body["agentRunRef"]
+    def _current_view(self, ctx: HandlerContext) -> dict[str, Any]:
         return self.engine.current(
             ctx.params["runId"],
-            actor=actor,
+            actor=ctx.actor_view(),
             node_id=ctx.body.get("nodeId") or ctx.request.query_one("nodeId"),
-            adopt=adopt,
         )
 
     def _handle_claim_node(self, ctx: HandlerContext) -> HandlerResult:

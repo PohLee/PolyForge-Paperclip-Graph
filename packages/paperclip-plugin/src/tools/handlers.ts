@@ -23,9 +23,10 @@
  * ## `current --adopt`
  *
  * Adoption is allowed **only when the previous owner is confirmed stopped**. The bridge asks the
- * work port to stop the previous run; only `confirmed_stopped`, `already_terminal` or
- * `not_found` permits a new claim. `unknown` returns a pending envelope and no claim — a lease
- * expiry is a reason to *check*, never a reason to assume the old worker stopped.
+ * work port whether the previous run is already absent or terminal; this SDK baseline has no
+ * run-scoped stop operation, so it cannot terminate a live run. Only `confirmed_stopped`,
+ * `already_terminal` or `not_found` permits a new claim. `unknown` returns a pending envelope and
+ * no claim — a lease expiry is a reason to *check*, never a reason to assume the old worker stopped.
  *
  * The lease epoch is never invented here. The bridge sends the claim, and the Core (the only
  * authority on epochs) returns the new one. The bridge then *verifies the returned epoch
@@ -495,6 +496,7 @@ export function makeToolHandlers(deps: ToolHandlerDeps) {
     }
 
     // Lease expiry is a reason to check, not a reason to assume the old worker stopped.
+    let priorWorkerState: "stopped" | undefined;
     if (contract.previousOwnerAgentRunId !== null && contract.previousOwnerAgentRunId !== runCtx.runId) {
       const outcome = await deps.stopPreviousOwner(context.runCtx.companyId, {
         provider: "paperclip",
@@ -523,6 +525,9 @@ export function makeToolHandlers(deps: ToolHandlerDeps) {
           message,
         );
       }
+      // Only the bridge derives this assertion after its host adapter reports a terminal,
+      // missing, or otherwise confirmed-stopped execution. Tool parameters never carry it.
+      priorWorkerState = "stopped";
     }
 
     const previousEpoch = contract.leaseEpoch ?? 0;
@@ -533,8 +538,8 @@ export function makeToolHandlers(deps: ToolHandlerDeps) {
         runId: context.binding.runId,
         nodeId,
         iteration: contract.iteration,
-        attemptId: contract.attemptId ?? "",
-        leaseEpoch: previousEpoch,
+        leaseEpoch: expectedEpoch,
+        priorWorkerState,
         agentSubject: `agent:paperclip/${runCtx.agentId}`,
         agentRunRef: { provider: "paperclip", kind: "agent_run", id: runCtx.runId },
         issueRef:
@@ -593,7 +598,26 @@ export function makeToolHandlers(deps: ToolHandlerDeps) {
       nodeId,
       iteration: contract.iteration,
     });
-    const grantedAttemptId = readAttemptId(claimed) ?? local?.attemptId ?? contract.attemptId ?? "";
+    const responseAttemptId = readAttemptId(claimed);
+    if (grantedEpoch !== null && !responseAttemptId) {
+      deps.bump(context.runCtx.companyId, "staleLeaseRejected");
+      const message = "the Core granted a lease epoch without returning the new attempt id";
+      deps.warn("claim response omitted its authoritative attempt id", {
+        runId: context.binding.runId,
+        nodeId,
+        grantedEpoch,
+      });
+      return refuse(
+        toolEnvelope({
+          runId: context.binding.runId,
+          stateVersion: claimed.stateVersion,
+          status: "LEASE_NOT_FENCED",
+          blockers: [{ code: "BRIDGE_LEASE_FENCED", reason: "BLOCKED_LEASE_FENCED", message }],
+        }),
+        message,
+      );
+    }
+    const grantedAttemptId = responseAttemptId ?? local?.attemptId ?? contract.attemptId ?? "";
     const stored: ToolClaim =
       grantedEpoch !== null
         ? {
@@ -713,10 +737,20 @@ export function makeToolHandlers(deps: ToolHandlerDeps) {
         );
       }
       const source = asRecord(artifact["source"]);
-      const sourceKind = (typeof source["kind"] === "string" ? source["kind"] : "inline") as
-        | "attachment"
-        | "document"
-        | "inline";
+      const rawSourceKind = source["kind"];
+      if (rawSourceKind !== "document" && rawSourceKind !== "inline") {
+        const message = `artifact source kind "${String(rawSourceKind ?? "")}" is unsupported; use document or inline`;
+        return refuse(
+          toolEnvelope({
+            runId: context.binding.runId,
+            stateVersion: contract.stateVersion,
+            status: "ARTIFACT_REFUSED",
+            blockers: [{ code: "BRIDGE_UNSUPPORTED", reason: "BLOCKED_PLATFORM", message }],
+          }),
+          message,
+        );
+      }
+      const sourceKind = rawSourceKind;
       const sourceRef = typeof source["ref"] === "string" ? source["ref"] : undefined;
       // The source is re-scoped to the bound issue. A caller cannot name another issue, and
       // cannot pass a URL or a traversing path (the artifact port refuses those outright).
